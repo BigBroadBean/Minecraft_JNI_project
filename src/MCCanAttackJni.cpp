@@ -1371,16 +1371,37 @@ static DWORD WINAPI JniWorker(LPVOID)
             while (mapIdx < kMapCount && !ok) {
                 CopyName(g_status->errMsg, sizeof(g_status->errMsg),
                          kAllMaps[mapIdx]->name);
-                ok = ResolveWith(env, *kAllMaps[mapIdx], res, loader, clsCls, forName);
-                // 当前加载器失败时, 同轮换另一个加载器再试 (TCL 与 app loader 都覆盖)
+                // 尝试当前加载器
+                Resolved tryRes;
+                bool tryOk = ResolveWith(env, *kAllMaps[mapIdx], tryRes, loader, clsCls, forName);
+                if (tryOk) {
+                    // 终极验证: getMinecraft() 必须返回真实例, 排除双份类副本
+                    jobject inst = env->CallStaticObjectMethod(tryRes.mcClass, tryRes.getMinecraft);
+                    bool hasInst = (inst != NULL);
+                    if (env->ExceptionCheck()) env->ExceptionClear();
+                    if (inst) env->DeleteLocalRef(inst);
+                    if (hasInst) { res = tryRes; ok = true; }
+                    else {
+                        CopyName(g_status->errMsg, sizeof(g_status->errMsg),
+                                 kAllMaps[mapIdx]->name);
+                        NoteErr(kAllMaps[mapIdx]->name, "getMinecraft()=null(副本)");
+                    }
+                }
+                // 当前加载器失败/副本时, 同轮换另一个加载器再试 (TCL 与 app loader 都覆盖)
                 if (!ok && gameLoader && sysLoader && gameLoader != sysLoader) {
                     jobject loader2 = (loader == gameLoader) ? sysLoader : gameLoader;
-                    Resolved res2;
-                    bool ok2 = ResolveWith(env, *kAllMaps[mapIdx], res2, loader2, clsCls, forName);
-                    if (ok2) {
-                        res = res2;
-                        ok = true;
-                        useGameLoader = (loader2 == gameLoader);
+                    Resolved tryRes2;
+                    bool tryOk2 = ResolveWith(env, *kAllMaps[mapIdx], tryRes2, loader2, clsCls, forName);
+                    if (tryOk2) {
+                        jobject inst2 = env->CallStaticObjectMethod(tryRes2.mcClass, tryRes2.getMinecraft);
+                        bool hasInst2 = (inst2 != NULL);
+                        if (env->ExceptionCheck()) env->ExceptionClear();
+                        if (inst2) env->DeleteLocalRef(inst2);
+                        if (hasInst2) {
+                            res = tryRes2;
+                            ok = true;
+                            useGameLoader = (loader2 == gameLoader);
+                        }
                     }
                 }
                 if (!ok) mapIdx++;
