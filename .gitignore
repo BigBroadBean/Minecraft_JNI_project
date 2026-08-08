@@ -1,0 +1,26 @@
+# ===== 编译产物 =====
+*.o
+*.obj
+
+# ===== 二进制产物 (如需发布可取消注释) =====
+# MCCanAttackJni.dll
+# injector.exe
+
+# ===== 日志 / 诊断 =====
+*.log
+verify/probe.log
+verify/game_out.log
+verify/mini.log
+
+# ===== 验证临时目录 =====
+# 注意: 内含 Mojang 官方映射文件 (禁止再分发) 与大量调试临时文件
+verify/*
+!verify/README.md
+
+# ===== 假客户端编译输出 =====
+test/out/
+test/*/out/
+
+# ===== 系统文件 =====
+Thumbs.db
+Desktop.ini
