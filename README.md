@@ -1,5 +1,7 @@
 # MCCanAttack-JNI — Minecraft 能否攻击检测工具 (C++ JNI DLL 注入)
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 通过向运行中的 Minecraft (java/javaw 进程) 注入 DLL，每 50ms 读取
 `Minecraft` 单例的 `thePlayer` / `objectMouseOver`，判断玩家当前
 **是否瞄准到了一个可以攻击的生物**，并把结果写入共享内存供外部程序读取。
