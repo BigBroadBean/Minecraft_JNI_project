@@ -2,11 +2,12 @@
 //  MCCanAttackJni.dll
 //  通过 JNI 注入到 Minecraft (java/javaw) 进程中的工具 DLL。
 //
-//  功能: 每 50ms 读取一次:
+//  功能: 每 5ms 读取一次:
 //      Minecraft.getMinecraft().thePlayer / player
 //      Minecraft.getMinecraft().objectMouseOver / hitResult
 //  判断玩家当前是否 "瞄准到了一个可以攻击的生物", 并把结果写入
-//  共享内存 (Local\MCCanAttackStatus_<pid>), 供外部程序读取。
+//  共享内存 (Local\MCCanAttackStatus_<pid>), 同时通过 UDP 向本机
+//  35785 端口发送 1 字节 (0x31='1'=可以攻击 / 0x30='0'=不可以)。
 //
 //  支持 5 套命名体系 (按顺序自动尝试):
 //    1. mcp189      MCP 反混淆客户端 1.8.9 (MCP 名)
@@ -22,6 +23,7 @@
 //============================================================================
 
 #define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
 #include <windows.h>
 #include <jni.h>
 #include <jvmti.h>
@@ -62,6 +64,10 @@ static const DWORD kVersion    = 4;
 static HANDLE           g_map    = NULL;
 static CanAttackStatus* g_status = NULL;
 static volatile LONG    g_stop   = 0;
+
+// UDP 上报: 向本机 35785 端口发送 0/1 (1=可以攻击, 0=不可以)
+static SOCKET               g_sock = INVALID_SOCKET;
+static struct sockaddr_in   g_dst;
 
 static void CopyName(char* dst, size_t cap, const char* src); // 前向声明
 static jclass FindLoadedGameClass(JNIEnv* env, jobject loader, const char* name,
@@ -303,22 +309,12 @@ static const int kMapCount = (int)(sizeof(kAllMaps) / sizeof(kAllMaps[0]));
 // 对 loadClass 的重写; 游戏类已加载时这是最可靠的获取方式)
 static jclass FindLoadedClassByName(JNIEnv* env, jobject loader, const char* slashName)
 {
-    // 逐步文件日志 (定位 flc 内部失败点)
-    #define FLC_LOG(step) do { \
-        FILE* f3 = fopen("C:\\Users\\11407\\Desktop\\MCCanAttack-JNI\\verify\\probe.log", "a"); \
-        if (f3) { fprintf(f3, "[pid=%lu t=%lu] FLC %s: %s\n", \
-            (unsigned long)GetCurrentProcessId(), (unsigned long)GetTickCount(), step, slashName); \
-            fclose(f3); } \
-    } while (0)
     if (!loader) return NULL;
-    FLC_LOG("start");
     jclass loaderCls = env->FindClass("java/lang/ClassLoader");
-    if (!loaderCls) { env->ExceptionClear(); FLC_LOG("find-cl-fail"); return NULL; }
-    FLC_LOG("cls-ok");
+    if (!loaderCls) { env->ExceptionClear(); return NULL; }
     jmethodID flc = env->GetMethodID(loaderCls, "findLoadedClass",
                                      "(Ljava/lang/String;)Ljava/lang/Class;");
-    if (!flc) { env->ExceptionClear(); FLC_LOG("mid-fail"); return NULL; }
-    FLC_LOG("mid-ok");
+    if (!flc) { env->ExceptionClear(); return NULL; }
     // 斜杠名转点分名
     char dot[256];
     size_t n = strlen(slashName);
@@ -326,22 +322,10 @@ static jclass FindLoadedClassByName(JNIEnv* env, jobject loader, const char* sla
     for (size_t i = 0; i < n; ++i) dot[i] = (slashName[i] == '/') ? '.' : slashName[i];
     dot[n] = 0;
     jstring nm = env->NewStringUTF(dot);
-    if (!nm) { env->ExceptionClear(); FLC_LOG("newstr-fail"); return NULL; }
-    FLC_LOG("newstr-ok");
+    if (!nm) { env->ExceptionClear(); return NULL; }
     jclass c = (jclass)env->CallObjectMethod(loader, flc, nm);
-    if (env->ExceptionCheck()) { env->ExceptionClear(); FLC_LOG("call-exception"); }
+    if (env->ExceptionCheck()) { env->ExceptionClear(); }
     env->DeleteLocalRef(nm);
-    FLC_LOG(c ? "HIT" : "miss");
-    if (!c) {
-        FILE* f3b = fopen("C:\\Users\\11407\\Desktop\\MCCanAttack-JNI\\verify\\probe.log", "a");
-        if (f3b) {
-            fprintf(f3b, "[pid=%lu t=%lu] FLC miss loader=%p: %s\n",
-                    (unsigned long)GetCurrentProcessId(), (unsigned long)GetTickCount(),
-                    (void*)loader, slashName);
-            fclose(f3b);
-        }
-    }
-    #undef FLC_LOG
     return c; // 可能为 NULL (未加载)
 }
 
@@ -495,6 +479,7 @@ static jobject FindThreadClassLoader(JNIEnv* env, jclass clsCls, jmethodID forNa
 
     DWORD tStart = GetTickCount();
     jobject found = NULL;
+    jobject found2 = NULL; // 后备 loader (只能加载混淆名等非标准类)
     while (env->CallBooleanMethod(it, hasNext)) {
         if (GetTickCount() - tStart > 10000) break; // 10 秒超时保护
         if (g_status) CopyName(g_status->errMsg, sizeof(g_status->errMsg), "T6:hasNext");
@@ -506,17 +491,31 @@ static jobject FindThreadClassLoader(JNIEnv* env, jclass clsCls, jmethodID forNa
         if (g_status) CopyName(g_status->errMsg, sizeof(g_status->errMsg), "T8:getCtx");
         if (env->ExceptionCheck()) { env->ExceptionClear(); continue; }
         if (!loader) continue;
-        // 测试这个加载器能否加载游戏主类 (任一映射表的 mcClass)
-        for (int i = 0; i < kMapCount; ++i) {
+        // 测试这个加载器能否加载游戏主类。
+        // 注意: 验证标准不能太弱——AppClassLoader 若 classpath 混入其他版本
+        // 残留 jar (如能加载 1.8.9 的 ave), 会被误选。优先要求能加载
+        // MCP/Mojang 名 net/minecraft/client/Minecraft (1.8.9~1.20.1 通用);
+        // 只有全部 loader 都不行时, 才接受能加载其他 mcClass 的 loader。
+        jclass mcProbe = LoadClass(env, "net/minecraft/client/Minecraft",
+                                   loader, clsCls, forName);
+        if (mcProbe) {
+            env->DeleteLocalRef(mcProbe);
+            found = loader;      // 首选: 能加载标准 Minecraft 类
+            break;
+        }
+        // 后备: 能加载其他候选 (如 1.8.9 混淆名 ave)
+        for (int i = 0; i < kMapCount && !found2; ++i) {
+            if (strcmp(kAllMaps[i]->mcClass, "net/minecraft/client/Minecraft") == 0)
+                continue; // 已测过
             jclass probe = LoadClass(env, kAllMaps[i]->mcClass, loader, clsCls, forName);
             if (probe) {
                 env->DeleteLocalRef(probe);
-                found = loader;
+                found2 = loader;
                 break;
             }
         }
-        if (found) break;
     }
+    if (!found) found = found2; // 无首选时用后备
     if (g_status) CopyName(g_status->errMsg, sizeof(g_status->errMsg), "T9:done");
     if (env->ExceptionCheck()) env->ExceptionClear();
     return found;
@@ -751,6 +750,16 @@ static void CopyName(char* dst, size_t cap, const char* src)
 }
 
 //--------------------------------------------------------------------------
+// UDP 上报: 向本机 35785 端口发送 1 字节 (0x31='1'=可以攻击 / 0x30='0'=不可以)
+//--------------------------------------------------------------------------
+static void SendCanAttack(int canAttack)
+{
+    if (g_sock == INVALID_SOCKET) return;
+    char b = canAttack ? '1' : '0';
+    sendto(g_sock, &b, 1, 0, (const struct sockaddr*)&g_dst, sizeof(g_dst));
+}
+
+//--------------------------------------------------------------------------
 // 每帧更新: 计算 "是否能攻击" 并写入共享内存
 //--------------------------------------------------------------------------
 static void UpdateStatus(JNIEnv* env, const Resolved& r)
@@ -875,274 +884,6 @@ static void UpdateStatus(JNIEnv* env, const Resolved& r)
     env->PopLocalFrame(NULL);
 }
 
-//--------------------------------------------------------------------------
-// 深度探测: 探测关键类的加载结果与成员名, 写入 failLog (终极诊断)
-//--------------------------------------------------------------------------
-static void DeepProbeOne(JNIEnv* env, jobject loader, jclass clsCls, jmethodID forName,
-                          char* buf, int bufsize, int* pos, const char* tag)
-{
-    int p = *pos;
-    int n = snprintf(buf + p, bufsize - p, "[%s] ", tag);
-    p = (n > 0 && p + n < bufsize) ? p + n : p;
-
-    const char* classes[] = { "ave", "auh", "auh$a", "pk", "pr", "bew",
-                              "net/minecraft/client/Minecraft" };
-    for (int i = 0; i < 7; ++i) {
-        jclass c = LoadClass(env, classes[i], loader, clsCls, forName);
-        n = snprintf(buf + p, bufsize - p, "%s:%s ", classes[i], c ? "OK" : "X");
-        p = (n > 0 && p + n < bufsize) ? p + n : p;
-        if (c) env->DeleteLocalRef(c);
-    }
-
-    jclass ave = LoadClass(env, "ave", loader, clsCls, forName);
-    if (ave) {
-        struct { const char* n; const char* s; } ms[] = {
-            { "A", "()Lave;" }, { "func_71410_x", "()Lave;" },
-        };
-        for (int i = 0; i < 2; ++i) {
-            jmethodID id = env->GetStaticMethodID(ave, ms[i].n, ms[i].s);
-            if (env->ExceptionCheck()) env->ExceptionClear();
-            n = snprintf(buf + p, bufsize - p, "%s:%s ", ms[i].n, id ? "Y" : "N");
-            p = (n > 0 && p + n < bufsize) ? p + n : p;
-        }
-        jfieldID sF = env->GetStaticFieldID(ave, "S", "Lave;");
-        if (env->ExceptionCheck()) env->ExceptionClear();
-        jobject s = sF ? env->GetStaticObjectField(ave, sF) : NULL;
-        if (env->ExceptionCheck()) env->ExceptionClear();
-        n = snprintf(buf + p, bufsize - p, "S:%s ", s ? "SET" : "null");
-        p = (n > 0 && p + n < bufsize) ? p + n : p;
-        env->DeleteLocalRef(ave);
-    }
-
-    // Minecraft (Mojang 名) 的 getter 探测 (官方/SRG/混淆 三套候选)
-    jclass mc = LoadClass(env, "net/minecraft/client/Minecraft", loader, clsCls, forName);
-    if (mc) {
-        struct { const char* n; const char* s; } ms[] = {
-            { "func_71410_x", "()Lnet/minecraft/client/Minecraft;" },
-            { "getMinecraft", "()Lnet/minecraft/client/Minecraft;" },
-            { "getInstance", "()Lnet/minecraft/client/Minecraft;" },
-            { "N", "()Lnet/minecraft/client/Minecraft;" },
-            { "a", "()Lnet/minecraft/client/Minecraft;" },
-        };
-        for (int i = 0; i < 5; ++i) {
-            jmethodID id = env->GetStaticMethodID(mc, ms[i].n, ms[i].s);
-            if (env->ExceptionCheck()) env->ExceptionClear();
-            n = snprintf(buf + p, bufsize - p, "mc.%s:%s ", ms[i].n, id ? "Y" : "N");
-            p = (n > 0 && p + n < bufsize) ? p + n : p;
-        }
-        struct { const char* n; const char* s; } fs[] = {
-            { "player", "Lnet/minecraft/client/player/LocalPlayer;" },
-            { "t", "Lnet/minecraft/client/player/LocalPlayer;" },
-            { "hitResult", "Lnet/minecraft/world/phys/HitResult;" },
-            { "w", "Lnet/minecraft/world/phys/HitResult;" },
-        };
-        for (int i = 0; i < 4; ++i) {
-            jfieldID id = env->GetFieldID(mc, fs[i].n, fs[i].s);
-            if (env->ExceptionCheck()) env->ExceptionClear();
-            n = snprintf(buf + p, bufsize - p, "mc.%s:%s ", fs[i].n, id ? "Y" : "N");
-            p = (n > 0 && p + n < bufsize) ? p + n : p;
-        }
-        env->DeleteLocalRef(mc);
-    }
-    *pos = p;
-}
-
-static void DeepProbe(JNIEnv* env, jobject lLaunch, jobject lGame, jobject lSys,
-                      jclass clsCls, jmethodID forName)
-{
-    if (!g_status) return;
-    char buf[560];
-    int pos = 0;
-    int n;
-    // ===== 最先写: gameLoader 上 Minecraft 类的成员名探测 =====
-    if (lGame) {
-        jclass mcC = FindLoadedClassByName(env, lGame, "net/minecraft/client/Minecraft");
-        n = snprintf(buf + pos, sizeof(buf) - pos, "mccls:%s ", mcC ? "OK" : "X");
-        pos = (n > 0 && pos + n < (int)sizeof(buf)) ? pos + n : pos;
-        if (mcC) {
-            // 枚举所有方法名 (真相: 看真实成员名)
-            jmethodID gdm = env->GetMethodID(env->FindClass("java/lang/Class"),
-                                             "getDeclaredMethods", "()[Ljava/lang/reflect/Method;");
-            jobjectArray arr = gdm ? (jobjectArray)env->CallObjectMethod(mcC, gdm) : NULL;
-            if (env->ExceptionCheck()) env->ExceptionClear();
-            if (arr) {
-                jsize alen = env->GetArrayLength(arr);
-                jclass mthCls = env->FindClass("java/lang/reflect/Method");
-                jmethodID gmn = env->GetMethodID(mthCls, "getName", "()Ljava/lang/String;");
-                for (jsize ai = 0; ai < alen && ai < 14; ++ai) {
-                    jobject mth = env->GetObjectArrayElement(arr, ai);
-                    jstring mn = gmn ? (jstring)env->CallObjectMethod(mth, gmn) : NULL;
-                    const char* um = mn ? env->GetStringUTFChars(mn, NULL) : NULL;
-                    n = snprintf(buf + pos, sizeof(buf) - pos, "M:%s ", um ? um : "?");
-                    pos = (n > 0 && pos + n < (int)sizeof(buf)) ? pos + n : pos;
-                    if (um) env->ReleaseStringUTFChars(mn, um);
-                    env->DeleteLocalRef(mth);
-                }
-                if (env->ExceptionCheck()) env->ExceptionClear();
-                env->DeleteLocalRef(arr);
-            }
-            struct { const char* nm; const char* sg; } ms[] = {
-                { "getInstance", "()Lnet/minecraft/client/Minecraft;" },
-                { "N", "()Lnet/minecraft/client/Minecraft;" },
-                { "a", "()Lnet/minecraft/client/Minecraft;" },
-                { "func_71410_x", "()Lnet/minecraft/client/Minecraft;" },
-            };
-            for (int mi = 0; mi < 4; ++mi) {
-                jmethodID id = env->GetStaticMethodID(mcC, ms[mi].nm, ms[mi].sg);
-                if (env->ExceptionCheck()) env->ExceptionClear();
-                n = snprintf(buf + pos, sizeof(buf) - pos, "m.%s:%s ", ms[mi].nm, id ? "Y" : "N");
-                pos = (n > 0 && pos + n < (int)sizeof(buf)) ? pos + n : pos;
-            }
-            struct { const char* nm; const char* sg; } fs[] = {
-                { "player", "Lnet/minecraft/client/player/LocalPlayer;" },
-                { "t", "Lnet/minecraft/client/player/LocalPlayer;" },
-                { "hitResult", "Lnet/minecraft/world/phys/HitResult;" },
-                { "w", "Lnet/minecraft/world/phys/HitResult;" },
-            };
-            for (int fi = 0; fi < 4; ++fi) {
-                jfieldID id = env->GetFieldID(mcC, fs[fi].nm, fs[fi].sg);
-                if (env->ExceptionCheck()) env->ExceptionClear();
-                n = snprintf(buf + pos, sizeof(buf) - pos, "f.%s:%s ", fs[fi].nm, id ? "Y" : "N");
-                pos = (n > 0 && pos + n < (int)sizeof(buf)) ? pos + n : pos;
-            }
-            env->DeleteLocalRef(mcC);
-        }
-    }
-    // 显式探测 findLoadedClass 在 gameLoader 上的结果 (混淆名候选, 最先写!)
-    {
-        const char* cands[] = { "net/minecraft/client/Minecraft", "enn", "ave",
-                                "net/minecraft/world/phys/HitResult", "eeg" };
-        n = snprintf(buf + pos, sizeof(buf) - pos, "lGame=%p ",
-                     (void*)lGame);
-        pos = (n > 0 && pos + n < (int)sizeof(buf)) ? pos + n : pos;
-        for (int ci = 0; ci < 5; ++ci) {
-            jclass fc1 = lGame ? FindLoadedClassByName(env, lGame, cands[ci]) : NULL;
-            n = snprintf(buf + pos, sizeof(buf) - pos, "flc(%s):%s ",
-                         cands[ci], fc1 ? "OK" : "X");
-            pos = (n > 0 && pos + n < (int)sizeof(buf)) ? pos + n : pos;
-            if (fc1) env->DeleteLocalRef(fc1);
-        }
-    }
-    // 线程快照: 线程名 + context loader 类名 (定位 ModLauncher 环境)
-    {
-        jclass thCls = env->FindClass("java/lang/Thread");
-        jmethodID gAll = thCls ? env->GetStaticMethodID(thCls, "getAllStackTraces",
-                                                       "()Ljava/util/Map;") : NULL;
-        jobject tmap = gAll ? env->CallStaticObjectMethod(thCls, gAll) : NULL;
-        if (env->ExceptionCheck()) env->ExceptionClear();
-        if (tmap) {
-            jclass mCls = env->FindClass("java/util/Map");
-            jclass sCls = env->FindClass("java/util/Set");
-            jclass iCls = env->FindClass("java/util/Iterator");
-            jmethodID ks = env->GetMethodID(mCls, "keySet", "()Ljava/util/Set;");
-            jmethodID it = env->GetMethodID(sCls, "iterator", "()Ljava/util/Iterator;");
-            jmethodID hn = env->GetMethodID(iCls, "hasNext", "()Z");
-            jmethodID nx = env->GetMethodID(iCls, "next", "()Ljava/lang/Object;");
-            jmethodID gN = env->GetMethodID(thCls, "getName", "()Ljava/lang/String;");
-            jmethodID gC = env->GetMethodID(thCls, "getContextClassLoader",
-                                            "()Ljava/lang/ClassLoader;");
-            jobject ts = env->CallObjectMethod(tmap, ks);
-            jobject ti = env->CallObjectMethod(ts, it);
-            if (env->ExceptionCheck()) env->ExceptionClear();
-            int cnt = 0;
-            while (ti && env->CallBooleanMethod(ti, hn) && cnt < 12) {
-                if (env->ExceptionCheck()) { env->ExceptionClear(); break; }
-                jobject t = env->CallObjectMethod(ti, nx);
-                if (env->ExceptionCheck()) { env->ExceptionClear(); break; }
-                jstring tn = (jstring)env->CallObjectMethod(t, gN);
-                jobject tl = env->CallObjectMethod(t, gC);
-                if (env->ExceptionCheck()) env->ExceptionClear();
-                const char* un = tn ? env->GetStringUTFChars(tn, NULL) : NULL;
-                char lname[48] = "null";
-                if (tl) {
-                    jclass lc2 = env->GetObjectClass(tl);
-                    jclass cc2 = env->FindClass("java/lang/Class");
-                    jmethodID gn2 = env->GetMethodID(cc2, "getName", "()Ljava/lang/String;");
-                    jstring ln = (jstring)env->CallObjectMethod(lc2, gn2);
-                    const char* ul = ln ? env->GetStringUTFChars(ln, NULL) : NULL;
-                    if (ul) { snprintf(lname, sizeof(lname), "%s", ul); env->ReleaseStringUTFChars(ln, ul); }
-                    if (env->ExceptionCheck()) env->ExceptionClear();
-                }
-                n = snprintf(buf + pos, sizeof(buf) - pos, "T[%s]=%s ",
-                             un ? un : "?", lname);
-                pos = (n > 0 && pos + n < (int)sizeof(buf)) ? pos + n : pos;
-                if (un) env->ReleaseStringUTFChars(tn, un);
-                cnt++;
-            }
-            if (env->ExceptionCheck()) env->ExceptionClear();
-        }
-    }
-    n = snprintf(buf + pos, sizeof(buf) - pos, "launchLoader:%s ",
-                 lLaunch ? "OK" : "NULL");
-    pos = (n > 0 && pos + n < (int)sizeof(buf)) ? pos + n : pos;
-    if (lLaunch) {
-        // findLoadedClass("ave") 探测: 游戏已加载的类
-        jclass loadedAve = FindLoadedGameClass(env, lLaunch, "ave", clsCls, forName,
-                                               "A", "()Lave;");
-        n = snprintf(buf + pos, sizeof(buf) - pos, "findLoaded(ave):%s ",
-                     loadedAve ? "OK" : "X");
-        pos = (n > 0 && pos + n < (int)sizeof(buf)) ? pos + n : pos;
-        if (loadedAve) env->DeleteLocalRef(loadedAve);
-    }
-    if (lLaunch) {
-        DeepProbeOne(env, lLaunch, clsCls, forName, buf, sizeof(buf), &pos, "LCL");
-    }
-    if (lGame && lGame != lLaunch) {
-        DeepProbeOne(env, lGame, clsCls, forName, buf, sizeof(buf), &pos, "GAME");
-    }
-    if (lSys && lSys != lLaunch && lSys != lGame) {
-        DeepProbeOne(env, lSys, clsCls, forName, buf, sizeof(buf), &pos, "SYS");
-    }
-    CopyName(g_status->failLog, sizeof(g_status->failLog), buf);
-    // 文件日志 (避免共享内存竞争)
-    FILE* pf = fopen("C:\\Users\\11407\\Desktop\\MCCanAttack-JNI\\verify\\probe.log", "a");
-    if (pf) {
-        fprintf(pf, "[pid=%lu t=%lu] %s\n",
-                (unsigned long)GetCurrentProcessId(), (unsigned long)GetTickCount(), buf);
-        fclose(pf);
-    }
-}
-
-// 探测系统类加载器 (app loader) 能否加载游戏类 (终极兜底验证)
-static void ProbeSystemLoader(JNIEnv* env, jclass clsCls, jmethodID forName)
-{
-    if (!g_status) return;
-    jclass clCls = env->FindClass("java/lang/ClassLoader");
-    jmethodID getSys = clCls ? env->GetStaticMethodID(clCls, "getSystemClassLoader",
-                                                      "()Ljava/lang/ClassLoader;") : NULL;
-    if (!getSys) { if (env->ExceptionCheck()) env->ExceptionClear(); return; }
-    jobject sys = env->CallStaticObjectMethod(clCls, getSys);
-    if (env->ExceptionCheck()) env->ExceptionClear();
-    if (!sys) return;
-
-    char buf[200];
-    int pos = 0;
-    const char* classes[] = { "ave", "net/minecraft/client/Minecraft" };
-    for (int i = 0; i < 2; ++i) {
-        jclass c = LoadClass(env, classes[i], sys, clsCls, forName);
-        int n = snprintf(buf + pos, sizeof(buf) - pos, "sys:%s:%s ", classes[i], c ? "OK" : "X");
-        pos = (n > 0 && pos + n < (int)sizeof(buf)) ? pos + n : pos;
-        if (c && strcmp(classes[i], "ave") == 0) {
-            jmethodID m1 = env->GetStaticMethodID(c, "A", "()Lave;");
-            if (env->ExceptionCheck()) env->ExceptionClear();
-            jmethodID m2 = env->GetStaticMethodID(c, "func_71410_x", "()Lave;");
-            if (env->ExceptionCheck()) env->ExceptionClear();
-            n = snprintf(buf + pos, sizeof(buf) - pos, "A:%s func:%s ",
-                         m1 ? "Y" : "N", m2 ? "Y" : "N");
-            pos = (n > 0 && pos + n < (int)sizeof(buf)) ? pos + n : pos;
-            env->DeleteLocalRef(c);
-        } else if (c) {
-            env->DeleteLocalRef(c);
-        }
-    }
-    int n2 = snprintf(buf + pos, sizeof(buf) - pos, "sysName:%s",
-                      (g_status->loaderName[0] ? g_status->loaderName : "?"));
-    pos = (n2 > 0 && pos + n2 < (int)sizeof(buf)) ? pos + n2 : pos;
-    env->DeleteLocalRef(sys);
-    CopyName(g_status->failLog, sizeof(g_status->failLog), buf);
-}
-
-//--------------------------------------------------------------------------
 // JVMTI 终极方案: 枚举所有已加载的类, 找到"真 Minecraft 类"
 // (A()/getMinecraft 返回非 null 的那份 —— 无论它由哪个加载器加载,
 //  规避所有双份类副本问题)
@@ -1272,13 +1013,26 @@ static DWORD WINAPI JniWorker(LPVOID)
     g_status->version = kVersion;
     g_status->pid     = GetCurrentProcessId();
 
-    // 等待 jvm.dll 被加载 (游戏进程启动后很快就有), 最多等 60 秒
-    HMODULE jvm = NULL;
-    for (int i = 0; i < 600 && !g_stop; ++i) {
-        jvm = GetModuleHandleA("jvm.dll");
-        if (!jvm) Sleep(100);
+    // UDP: 初始化 socket, 目标为本机 35785 端口
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) == 0) {
+        g_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (g_sock != INVALID_SOCKET) {
+            memset(&g_dst, 0, sizeof(g_dst));
+            g_dst.sin_family      = AF_INET;
+            g_dst.sin_port        = htons(35785);
+            g_dst.sin_addr.s_addr = inet_addr("127.0.0.1");
+        }
     }
-    if (!jvm || g_stop) return 0;
+
+    // 等待 jvm.dll 被加载 (游戏进程启动后很快就有), 无限等待直到 g_stop
+    HMODULE jvm = NULL;
+    while (!g_stop) {
+        jvm = GetModuleHandleA("jvm.dll");
+        if (jvm) break;
+        Sleep(200);
+    }
+    if (!jvm || g_stop) return 0; // 仅进程退出时才会走到这里
 
     typedef jint (JNICALL* GetCreatedVMs_t)(JavaVM**, jsize, jsize*);
     GetCreatedVMs_t getVMs = (GetCreatedVMs_t)GetProcAddress(jvm, "JNI_GetCreatedJavaVMs");
@@ -1357,7 +1111,6 @@ static DWORD WINAPI JniWorker(LPVOID)
     }
 
     Resolved res = {};
-    int      failCount = 0;
     int      mapIdx    = 0;
     int      nullMcStreak = 0;
 
@@ -1411,7 +1164,7 @@ static DWORD WINAPI JniWorker(LPVOID)
                 CopyName(g_status->mappingName, sizeof(g_status->mappingName), res.name);
                 // 终极修正: JVMTI 找"真 Minecraft 类" (getter 返回非 null),
                 // 用它的类加载器重新解析, 彻底解决双份类副本问题
-                const JniMap& mOk = *kAllMaps[mapIdx - 1];
+                const JniMap& mOk = *kAllMaps[mapIdx]; // mapIdx 此时指向成功的那套
 #ifndef NO_REAL_FIX
                 // 终极修正 A: findLoadedClass 拿游戏已加载的真类
                 jclass realMc = FindLoadedGameClass(env, launchLoader, mOk.mcClass,
@@ -1437,41 +1190,18 @@ static DWORD WINAPI JniWorker(LPVOID)
                 }
 #endif // NO_REAL_FIX
                 CopyName(g_status->errMsg, sizeof(g_status->errMsg), ""); // 清调试残留
-            } else if (++failCount > 240) { // 2 分钟后仍失败则放弃
-                g_status->lastError = 200; // 映射解析失败
-                break;
             } else {
-                // 先记录本轮解析失败点 (errMsg 含最后一个 map 的失败详情)
-                FILE* pf2 = fopen("C:\\Users\\11407\\Desktop\\MCCanAttack-JNI\\verify\\probe.log", "a");
-                if (pf2) {
-                    // 打印当前解析用的 loader 类名
-                    char lname[64] = "NULL";
-                    if (loader) {
-                        jclass lc2 = env->GetObjectClass(loader);
-                        jmethodID gn2 = clsCls ? env->GetMethodID(clsCls, "getName", "()Ljava/lang/String;") : NULL;
-                        jstring ln2 = gn2 ? (jstring)env->CallObjectMethod(lc2, gn2) : NULL;
-                        const char* ul2 = ln2 ? env->GetStringUTFChars(ln2, NULL) : NULL;
-                        if (ul2) { snprintf(lname, sizeof(lname), "%s", ul2); env->ReleaseStringUTFChars(ln2, ul2); }
-                        if (env->ExceptionCheck()) env->ExceptionClear();
-                    }
-                    fprintf(pf2, "[pid=%lu t=%lu] FAIL[useGameLoader=%d loader=%s]: %s\n",
-                            (unsigned long)GetCurrentProcessId(), (unsigned long)GetTickCount(),
-                            (int)useGameLoader, lname,
-                            g_status->errMsg);
-                    fclose(pf2);
-                }
-                // 再探测 (probe.log 无条件写入)
-                DeepProbe(env, launchLoader, gameLoader, sysLoader, clsCls, forName);
+                // 永不放弃: 持续重试直到解析成功 (防止半路永久失效)
                 Sleep(500);
                 continue;
             }
         }
         UpdateStatus(env, res);
-        // 无条件每轮探测 (结果写入 probe.log 文件, 不受共享内存竞争影响)
-        DeepProbe(env, launchLoader, gameLoader, sysLoader, clsCls, forName);
+        // UDP 上报: 1 = 可以攻击, 0 = 不可以 (与检查同频, 每 5ms)
+        SendCanAttack(g_status ? g_status->canAttack : 0);
         // 若长期拿不到主类 (双份类副本), 自动切换加载器重新解析
         if (g_status->mcNull) {
-            if (++nullMcStreak > 10) { // 连续 0.5 秒拿不到 mc
+            if (++nullMcStreak > 100) { // 连续 0.5 秒拿不到 mc (每 5ms 一次)
                 nullMcStreak = 0;
                 if (gameLoader && sysLoader) {
                     useGameLoader = !useGameLoader; // 游戏加载器 <-> 系统加载器 切换
@@ -1486,9 +1216,12 @@ static DWORD WINAPI JniWorker(LPVOID)
         } else {
             nullMcStreak = 0;
         }
-        Sleep(50);
+        Sleep(5); // 5ms 周期检查
     }
 
+    // 清理 UDP
+    if (g_sock != INVALID_SOCKET) { closesocket(g_sock); g_sock = INVALID_SOCKET; }
+    WSACleanup();
     vm->DetachCurrentThread();
     return 0;
 }
@@ -1546,6 +1279,8 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
     else if (reason == DLL_PROCESS_DETACH) {
         InterlockedExchange(&g_stop, 1);
         Sleep(100);
+        if (g_sock != INVALID_SOCKET) { closesocket(g_sock); g_sock = INVALID_SOCKET; }
+        WSACleanup();
         if (g_status) { UnmapViewOfFile(g_status); g_status = NULL; }
         if (g_map)    { CloseHandle(g_map);    g_map    = NULL; }
     }

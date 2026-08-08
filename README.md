@@ -2,9 +2,11 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-通过向运行中的 Minecraft (java/javaw 进程) 注入 DLL，每 50ms 读取
+通过向运行中的 Minecraft (java/javaw 进程) 注入 DLL，每 5ms 读取
 `Minecraft` 单例的 `thePlayer` / `objectMouseOver`，判断玩家当前
-**是否瞄准到了一个可以攻击的生物**，并把结果写入共享内存供外部程序读取。
+**是否瞄准到了一个可以攻击的生物**，并通过 UDP 向本机 35785 端口
+持续上报 1 字节 (0x31='1'=可以攻击 / 0x30='0'=不可以)，同时把结果
+写入共享内存供外部程序读取。
 
 ## 支持的版本 / 客户端
 
@@ -44,14 +46,14 @@ canAttack = (objectMouseOver != null)
 ```
 MCCanAttack-JNI/
 ├── build.bat                 一键编译 (需要 MinGW-w64 g++)
-├── MCCanAttackJni.dll        注入到游戏进程的 JNI 工具 DLL
-├── injector.exe              注入器 + 实时状态监视器
+├── MCCanAttackJni.dll        注入到游戏进程的 JNI 工具 DLL (检测 + UDP 上报)
+├── injector.exe              注入器 (注入即退出, 无显示)
 ├── include/                  JNI/JVMTI 头文件
 ├── src/
-│   ├── MCCanAttackJni.cpp    注入 DLL 源码 (6 套映射表 + 环境探测 + 诊断)
+│   ├── MCCanAttackJni.cpp    注入 DLL 源码 (9 套映射表 + 环境探测 + UDP 上报)
 │   └── injector.cpp          注入器源码
 ├── test/                     假客户端测试 (5 种命名体系各一套)
-├── verify/                   验证工具 (jmap/jcmd 记录、probe.log 诊断日志)
+├── verify/                   验证工具 (jmap/jcmd 记录等)
 ├── JNI零基础教学.md           零基础入门教程
 ├── 技术文档.md                总思路 + 架构原理 + 调试历程 + Forge 规律
 └── 避坑指南.md                JNI/注入开发避坑清单
@@ -60,23 +62,19 @@ MCCanAttack-JNI/
 ## 使用方法
 
 1. 启动游戏（上述任一环境），进入世界。
-2. 运行 `injector.exe`（与 DLL 同一目录）：
+2. 运行 `injector.exe`（与 DLL 同一目录），注入即退出：
    ```
    injector.exe                       自动查找 Minecraft 窗口并注入
-   injector.exe -once                 注入后打印一次状态即退出
    injector.exe -pid <PID>            手动指定进程
    injector.exe -dll <路径>           指定 DLL 文件 (绕过同名缓存)
    injector.exe -title <子串>         按窗口标题查找 (默认 "Minecraft")
    ```
-3. 控制台实时显示：
-   ```
-   [READY] env=forge+optifine+launchwrapper  map=forge189mcp  tick=123 inGame=1
-           hit=ENTITY canAttack=1 target=net.minecraft.entity.monster.EntityCreeper living=1 alive=1 err=0
-   ```
-   - `env`       : 环境探测（forge/optifine/fabric/launchwrapper）
-   - `map`       : 命中的命名体系
-   - `canAttack` : **核心结果，1 = 当前可以攻击准星所指的生物**
-   - `err/errMsg`: 失败详情（解析失败时显示具体类名+异常）
+3. DLL 注入后每 5ms 检测一次，并向本机 **35785 端口 (UDP)** 持续发送
+   1 字节：`0x31` ('1') = 当前可以攻击准星所指的生物，`0x30` ('0') = 不可以。
+   接收方无需应答，直接收 UDP 包即可。
+
+> 旧版的实时状态显示与 probe.log 诊断日志已移除；需要调试信息时可通过
+> 共享内存 `Local\MCCanAttackStatus_<pid>` 读取（字段含义见下文）。
 
 ## 导出函数 (供其他程序调用)
 
@@ -101,7 +99,8 @@ javac -encoding UTF-8 -d out TestMC1201F.java net\minecraft\client\Minecraft.jav
       net\minecraft\world\entity\LivingEntity.java net\minecraft\world\entity\Entity.java ^
       net\minecraft\world\phys\HitResult.java net\minecraft\world\phys\EntityHitResult.java
 java -cp out TestMC1201F        :: 另开终端运行下一条
-injector.exe -once              :: 看到 map=forge1201 canAttack=1 即通过
+injector.exe                    :: 注入后, 在本机 35785 端口收 UDP 0/1 即通过
+                                :: (可用 python 监听: python -c "import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(('127.0.0.1',35785));print(s.recvfrom(64))" 循环执行)
 ```
 
 **注意**：假客户端用 JDK 24 普通启动（单一类加载器），无法暴露
@@ -122,9 +121,11 @@ build.bat
    `CreateRemoteThread + LoadLibraryA` 注入 `MCCanAttackJni.dll`。
 2. DLL 内工作线程通过 `JNI_GetCreatedJavaVMs` 拿到 JavaVM 并 `AttachCurrentThread`，
    找到游戏类加载器（`Launch.classLoader`，注意字段类型是 `LaunchClassLoader`！），
-   用 JNI 反射解析 Minecraft 类/字段/方法 ID（6 套映射依次尝试）。
-3. 每 50ms 计算一次 canAttack，写入共享内存 `Local\MCCanAttackStatus_<pid>`，
-   同时把探测结果写入 `verify/probe.log`（诊断用）。
-4. `injector.exe`（或任何程序）读取共享内存即可获得实时状态。
+   用 JNI 反射解析 Minecraft 类/字段/方法 ID（9 套映射依次尝试）。
+3. 每 5ms 计算一次 canAttack，通过 UDP 向本机 35785 端口发送 1 字节
+   (0x31='1'=可以攻击 / 0x30='0'=不可以)，并写入共享内存
+   `Local\MCCanAttackStatus_<pid>`。
+4. 任何程序监听 35785 端口即可获得实时状态（无需调用 DLL 函数）；
+   也可读取共享内存获取完整状态（含 map/env 等诊断字段）。
 
 > 完整原理、真机排查过程与踩坑记录见《技术文档.md》和《避坑指南.md》。
