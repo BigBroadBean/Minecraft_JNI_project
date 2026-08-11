@@ -1,6 +1,6 @@
 //============================================================================
 //  injector.exe
-//  把 MCCanAttackJni.dll 注入到 Minecraft (java/javaw) 进程。
+//  把 MCCombatStatusJni.dll 注入到 Minecraft (java/javaw) 进程。
 //  DLL 注入后会自行向本机 35785 端口 UDP 上报 2 字节
 //  (byte0=canAttack '1'/'0', byte1=canPlace '1'/'0'), 无需监视。
 //
@@ -19,7 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 
-static const char* kDllName   = "MCCanAttackJni.dll";
+static const char* kDllName   = "MCCombatStatusJni.dll";
 
 static const char* g_titleSub = "Minecraft";
 static char        g_dllPath[MAX_PATH] = ""; // 非空时使用指定 DLL 路径

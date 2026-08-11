@@ -1,6 +1,6 @@
 # Minecraft 1.8.9 · JNI 注入工具 —— 零基础教学文档
 
-> 配套项目：`MCCombatStatus-JNI/`（桌面文件夹原名为 MCCanAttack-JNI，DLL 仍叫 MCCanAttackJni.dll）
+> 配套项目：`MCCombatStatus-JNI/`（桌面文件夹原名为 MCCanAttack-JNI，DLL 仍叫 MCCombatStatusJni.dll）
 > 本文从"完全不懂 JNI"开始，一步一步带你搞懂：Java 程序怎么跑、JNI 是什么、
 > DLL 注入是什么、以及我们的工具每一行代码在干什么。
 > 学完你可以自己改代码，做出"读取玩家坐标""读取目标血量"等新功能。
@@ -13,7 +13,7 @@
 - [第 1 章　五个必须搞懂的大概念](#第-1-章五个必须搞懂的大概念)
 - [第 2 章　目标拆解：怎么知道"能不能攻击"](#第-2-章目标拆解怎么知道能不能攻击)
 - [第 3 章　JNI 速成（最重要的一章）](#第-3-章jni-速成最重要的一章)
-- [第 4 章　逐行读代码：MCCanAttackJni.dll](#第-4-章逐行读代码mccanattackjnidll)
+- [第 4 章　逐行读代码：MCCombatStatusJni.dll](#第-4-章逐行读代码mccanattackjnidll)
 - [第 5 章　逐行读代码：injector.exe](#第-5-章逐行读代码injectorexe)
 - [第 6 章　动手实验与改造练习](#第-6-章动手实验与改造练习)
 - [第 7 章　常见坑与 FAQ](#第-7-章常见坑与-faq)
@@ -127,7 +127,7 @@ DLL（Dynamic Link Library）是 Windows 的动态链接库：
 
 - 里面是一堆编译好的函数，供程序调用。
 - 它**不是独立程序**，必须被某个进程"加载"进自己的内存里才能执行。
-- 我们的 `MCCanAttackJni.dll` 就是一个 DLL：加载进游戏进程后，
+- 我们的 `MCCombatStatusJni.dll` 就是一个 DLL：加载进游戏进程后，
   里面的代码就在游戏进程里运行了。
 
 ### 1.5 什么是 DLL 注入
@@ -460,9 +460,9 @@ CreateThread 启动工作线程
 
 ---
 
-## 第 4 章　逐行读代码：MCCanAttackJni.dll
+## 第 4 章　逐行读代码：MCCombatStatusJni.dll
 
-> 建议打开 `src/MCCanAttackJni.cpp` 对照着读。下面按文件顺序讲。
+> 建议打开 `src/MCCombatStatusJni.cpp` 对照着读。下面按文件顺序讲。
 
 ### 4.1 总体架构
 
@@ -475,13 +475,13 @@ DllMain (进程加载 DLL 时被 Windows 调用)
                         ├─ ResolveWith(kMcpMap) 失败就 ResolveWith(kObfMap)
                         └─ while: UpdateStatus() 每 50ms 一次
                                     │
-                                    └─ 结果写入共享内存 CanAttackStatus
+                                    └─ 结果写入共享内存 CombatStatus
 ```
 
 ### 4.2 共享内存结构体：门口的黑板
 
 ```cpp
-struct CanAttackStatus {        // 这个结构跨进程共享，所以全部用固定大小类型
+struct CombatStatus {        // 这个结构跨进程共享，所以全部用固定大小类型
     DWORD        magic;         // 魔法数 'MCAK'，用于校验"这是不是我们的黑板"
     DWORD        version;
     DWORD        pid;           // 被注入的进程 ID
@@ -686,11 +686,11 @@ static void UpdateStatus(JNIEnv* env, const Resolved& r)
 ```cpp
 extern "C" {   // 用 C 链接方式导出，名字不会被 C++ 修饰
 
-__declspec(dllexport) BOOL WINAPI CanAttackNow(void) {
+__declspec(dllexport) BOOL WINAPI GetCanAttackNow(void) {
     return (g_status && g_status->ready) ? (BOOL)g_status->canAttack : FALSE;
 }
 __declspec(dllexport) BOOL WINAPI IsJniReady(void) { ... }
-__declspec(dllexport) BOOL WINAPI GetCanAttackStatus(CanAttackStatus* out) {
+__declspec(dllexport) BOOL WINAPI GetCombatStatus(CombatStatus* out) {
     if (!out || !g_status) return FALSE;
     *out = *g_status;    // 把黑板内容整个拷贝给调用者
     return TRUE;
@@ -700,7 +700,7 @@ __declspec(dllexport) BOOL WINAPI GetCanAttackStatus(CanAttackStatus* out) {
 ```
 
 其他程序（比如你的 Python/易语言/另一个 C++ 程序）加载这个 DLL 后，
-直接调用 `CanAttackNow()` 就能拿到结果，**完全不需要懂 JNI**。
+直接调用 `GetCanAttackNow()` 就能拿到结果，**完全不需要懂 JNI**。
 这就是把"脏活"封装进 DLL 的价值。
 
 ---
@@ -757,11 +757,11 @@ static bool InjectDll(DWORD pid, const char* dllPath)
 ### 5.3 监视：打开同一块共享内存
 
 ```cpp
-// 共享内存名 = "Local\MCCanAttackStatus_" + 游戏 PID（和 DLL 里的规则一致）
+// 共享内存名 = "Local\MCCombatStatus_" + 游戏 PID（和 DLL 里的规则一致）
 snprintf(mapName, sizeof(mapName), kMapFmt, pid);
 HANDLE map = OpenFileMappingA(FILE_MAP_READ, FALSE, mapName);
 
-const CanAttackStatus* s = (CanAttackStatus*)MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0);
+const CombatStatus* s = (CombatStatus*)MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0);
 
 // 循环打印，Ctrl+C 退出
 while (true) {
@@ -781,7 +781,7 @@ while (true) {
 ┌──────────────┐   注入    ┌──────────────────────────────┐
 │  injector.exe │ ────────▶ │  java.exe (Minecraft 1.8.9)   │
 │              │           │   ┌────────────────────────┐  │
-│ 1. 找窗口     │           │   │ MCCanAttackJni.dll     │  │
+│ 1. 找窗口     │           │   │ MCCombatStatusJni.dll     │  │
 │ 2. 注入 DLL   │           │   │  DllMain               │  │
 │ 3. 读共享内存  │           │   │   └─ JniWorker 线程     │  │
 │ 4. 打印状态   │           │   │      ├─ JNI 拿 JavaVM   │  │
@@ -792,7 +792,7 @@ while (true) {
        │                   └───────────────┼──────────────┘
        │                                   │ 共享内存
        └────────────── 读取 ◀──────────────┘
-              Local\MCCanAttackStatus_<pid>
+              Local\MCCombatStatus_<pid>
 ```
 
 ---
@@ -804,9 +804,9 @@ while (true) {
 双击运行 `build.bat`（需要 MinGW-w64 g++，路径在脚本开头可改）：
 
 ```
-=== build MCCanAttackJni.dll ===
+=== build MCCombatStatusJni.dll ===
 === build injector.exe ===
-[OK] done: MCCanAttackJni.dll + injector.exe
+[OK] done: MCCombatStatusJni.dll + injector.exe
 ```
 
 ### 6.2 端到端测试（不用开游戏！）
@@ -842,12 +842,12 @@ injector.exe -once
 
 ### 6.3 改造练习 1：读取玩家坐标
 
-目标：在 `CanAttackStatus` 里加 3 个 double 字段，每帧写入玩家坐标。
+目标：在 `CombatStatus` 里加 3 个 double 字段，每帧写入玩家坐标。
 
 **第一步**：结构体加字段（DLL 和 injector 两边要同步改！）
 
 ```cpp
-// MCCanAttackJni.cpp 和 injector.cpp 都要加：
+// MCCombatStatusJni.cpp 和 injector.cpp 都要加：
 double playerX, playerY, playerZ;   // 放在 targetName 后面
 ```
 
@@ -907,8 +907,8 @@ extern "C" __declspec(dllexport) double WINAPI GetPlayerX(void) {
 
 ```python
 import ctypes
-dll = ctypes.WinDLL(r"C:\Users\11407\Desktop\MCCanAttack-JNI\MCCanAttackJni.dll")
-print("canAttack =", dll.CanAttackNow())
+dll = ctypes.WinDLL(r"C:\Users\11407\Desktop\MCCanAttack-JNI\MCCombatStatusJni.dll")
+print("canAttack =", dll.GetCanAttackNow())
 ```
 
 ### 6.6 自己查新名字的方法（重要技能！）
@@ -945,7 +945,7 @@ javap -p ave.class             :: 用 JDK 自带的反编译工具看成员
 
 ### 6.7 多版本适配：本项目 10 套映射是怎么来的
 
-项目当前按顺序自动尝试 10 套映射（`src/MCCanAttackJni.cpp` 里的 `kAllMaps[]`）：
+项目当前按顺序自动尝试 10 套映射（`src/MCCombatStatusJni.cpp` 里的 `kAllMaps[]`）：
 
 | # | 标识 | 适用环境 | 关键名字示例 |
 |---|---|---|---|

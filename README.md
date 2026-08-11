@@ -1,8 +1,8 @@
 # MCCombatStatus-JNI — Minecraft 战斗状态检测工具 (C++ JNI DLL 注入)
 
-> 原项目名 **MCCanAttack-JNI**（本仓库/目录沿用历史名称，仅展示名更新）。
-> 外部接口（DLL 文件名 `MCCanAttackJni.dll`、共享内存 `Local\MCCanAttackStatus_<pid>`、
-> 导出函数）**保持不变**，现有调用方无需改动。
+> 原项目名 **MCCanAttack-JNI**（仓库/目录沿用历史名称）。
+> V63 起 DLL、共享内存、导出函数全面更名（见"接口变更"一节），
+> 外部程序需同步适配。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -58,13 +58,13 @@ canPlace = (player.getHeldItem() / getMainHandItem() != null)   // 手持有物�
 ## 文件结构
 
 ```
-MCCanAttack-JNI/
+MCCombatStatus-JNI/
 ├── build.bat                 一键编译 (需要 MinGW-w64 g++)
-├── MCCanAttackJni.dll        注入到游戏进程的 JNI 工具 DLL (检测 + UDP 上报)
+├── MCCombatStatusJni.dll     注入到游戏进程的 JNI 工具 DLL (检测 + UDP 上报)
 ├── injector.exe              注入器 (注入即退出, 无显示)
 ├── include/                  JNI/JVMTI 头文件
 ├── src/
-│   ├── MCCanAttackJni.cpp    注入 DLL 源码 (10 套映射表 + 环境探测 + UDP 上报)
+│   ├── MCCombatStatusJni.cpp 注入 DLL 源码 (10 套映射表 + 环境探测 + UDP 上报)
 │   └── injector.cpp          注入器源码
 ├── test/                     假客户端测试 (7 套: 各命名体系一套)
 ├── verify/                   验证工具 (jmap/jcmd 记录等)
@@ -96,18 +96,33 @@ MCCanAttack-JNI/
    一次拿到两个状态。
 
 > 旧版的实时状态显示与 probe.log 诊断日志已移除；需要调试信息时可通过
-> 共享内存 `Local\MCCanAttackStatus_<pid>` 读取（字段含义见下文）。
+> 共享内存 `Local\MCCombatStatus_<pid>` 读取（字段含义见下文）。
 
 ## 导出函数 (供其他程序调用)
 
 | 函数 | 说明 |
 |---|---|
-| `BOOL CanAttackNow()` | 直接返回当前是否能攻击 |
+| `BOOL GetCanAttackNow()` | 直接返回当前是否能攻击 |
 | `BOOL IsJniReady()` | JNI 是否已就绪 |
-| `BOOL GetCanAttackStatus(CanAttackStatus*)` | 拷贝完整状态结构（含 map/env/canPlace 字段） |
+| `BOOL GetCombatStatus(CombatStatus*)` | 拷贝完整状态结构（含 map/env/canPlace 字段） |
 
-其他程序可通过共享内存 `Local\MCCanAttackStatus_<pid>` (结构见
-`MCCanAttackJni.cpp` 顶部) 读取状态，无需调用 DLL 函数。
+其他程序可通过共享内存 `Local\MCCombatStatus_<pid>` (结构见
+`MCCombatStatusJni.cpp` 顶部) 读取状态，无需调用 DLL 函数。
+
+## 接口变更 (V63)
+
+V63 起项目外部接口全面更名（原 `MCCanAttack` 前缀 → `MCCombatStatus`）：
+
+| 项 | 旧名 (V62-) | 新名 (V63+) |
+|---|---|---|
+| DLL 文件 | `MCCanAttackJni.dll` | `MCCombatStatusJni.dll` |
+| 源码文件 | `src/MCCanAttackJni.cpp` | `src/MCCombatStatusJni.cpp` |
+| 共享内存 | `Local\MCCanAttackStatus_<pid>` | `Local\MCCombatStatus_<pid>` |
+| 导出函数 | `CanAttackNow()` / `GetCanAttackStatus()` | `GetCanAttackNow()` / `GetCombatStatus()` |
+| 状态结构 | `CanAttackStatus` (magic `'MCAK'`, v6) | `CombatStatus` (magic `'MCST'`, v7) |
+
+UDP 35785 协议（2 字节 `[canAttack][canPlace]`）不变。调用 DLL 函数
+或读共享内存的外部程序需按新名适配。
 
 ## 测试方法（不需要开真实游戏）
 
@@ -143,13 +158,13 @@ build.bat
 ## 原理说明
 
 1. `injector.exe` 找到 java/javaw 进程后，用
-   `CreateRemoteThread + LoadLibraryA` 注入 `MCCanAttackJni.dll`。
+   `CreateRemoteThread + LoadLibraryA` 注入 `MCCombatStatusJni.dll`。
 2. DLL 内工作线程通过 `JNI_GetCreatedJavaVMs` 拿到 JavaVM 并 `AttachCurrentThread`，
    找到游戏类加载器（`Launch.classLoader`，注意字段类型是 `LaunchClassLoader`！），
    用 JNI 反射解析 Minecraft 类/字段/方法 ID（10 套映射依次尝试）。
 3. 每 5ms 计算一次 canAttack / canPlace，通过 UDP 向本机 35785 端口
    发送 2 字节 (byte0=canAttack, byte1=canPlace)，并写入共享内存
-   `Local\MCCanAttackStatus_<pid>`。
+   `Local\MCCombatStatus_<pid>`。
 4. 任何程序监听 35785 端口即可获得实时状态（无需调用 DLL 函数）；
    也可读取共享内存获取完整状态（含 map/env 等诊断字段）。
 

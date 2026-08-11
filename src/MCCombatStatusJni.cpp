@@ -1,5 +1,5 @@
 //============================================================================
-//  MCCanAttackJni.dll
+//  MCCombatStatusJni.dll
 //  通过 JNI 注入到 Minecraft (java/javaw) 进程中的工具 DLL。
 //
 //  功能: 每 5ms 读取一次:
@@ -7,7 +7,7 @@
 //      Minecraft.getMinecraft().objectMouseOver / hitResult
 //  判断玩家当前是否 "瞄准到了一个可以攻击的生物" (canAttack), 以及
 //  "手持物品是否为放置物" (canPlace, ItemBlock/BlockItem), 并把结果
-//  写入共享内存 (Local\MCCanAttackStatus_<pid>), 同时通过 UDP 向本机
+//  写入共享内存 (Local\MCCombatStatus_<pid>), 同时通过 UDP 向本机
 //  35785 端口发送 2 字节:
 //      byte0 = 0x31 '1'=可以攻击 / 0x30 '0'=不可以
 //      byte1 = 0x31 '1'=手持放置物 / 0x30 '0'=不是/空手
@@ -25,9 +25,9 @@
 //    8. forge1201obf/9. forge1201stb/10. forge1201 (Forge/NeoForge 1.20.1 三形态)
 //
 //  导出函数:
-//    BOOL CanAttackNow(void)          -- 直接返回当前是否能攻击
+//    BOOL GetCanAttackNow(void)       -- 直接返回当前是否能攻击
 //    BOOL IsJniReady(void)            -- JNI 是否已解析成功
-//    BOOL GetCanAttackStatus(Status*) -- 拷贝完整状态结构 (含 canPlace)
+//    BOOL GetCombatStatus(Status*)    -- 拷贝完整状态结构 (含 canPlace)
 //============================================================================
 
 #define WIN32_LEAN_AND_MEAN
@@ -42,9 +42,9 @@
 // 与 injector.exe 共享的状态结构 (布局固定, 跨进程共享)
 //--------------------------------------------------------------------------
 #pragma pack(push, 1)
-struct CanAttackStatus {
-    DWORD        magic;            // 0x4D43414B = 'MCAK'
-    DWORD        version;          // 6
+struct CombatStatus {
+    DWORD        magic;            // 0x4D435354 = 'MCST'
+    DWORD        version;          // 7
     DWORD        pid;              // 被注入进程的 PID
     volatile LONG ready;           // JNI 解析是否成功
     volatile LONG inGame;          // 是否已进入游戏 (mc && player != null)
@@ -69,13 +69,13 @@ struct CanAttackStatus {
 };
 #pragma pack(pop)
 
-static const char* kMapNameFmt = "Local\\MCCanAttackStatus_%lu";
-static const DWORD kMagic      = 0x4D43414B;
-static const DWORD kVersion    = 6;
+static const char* kMapNameFmt = "Local\\MCCombatStatus_%lu";
+static const DWORD kMagic      = 0x4D435354; // 'MCST'
+static const DWORD kVersion    = 7;
 
-static HANDLE           g_map    = NULL;
-static CanAttackStatus* g_status = NULL;
-static volatile LONG    g_stop   = 0;
+static HANDLE         g_map    = NULL;
+static CombatStatus*  g_status = NULL;
+static volatile LONG  g_stop   = 0;
 
 // UDP 上报: 向本机 35785 端口发送 0/1 (1=可以攻击, 0=不可以)
 static SOCKET               g_sock = INVALID_SOCKET;
@@ -1175,9 +1175,9 @@ static DWORD WINAPI JniWorker(LPVOID)
     snprintf(mapName, sizeof(mapName), kMapNameFmt, (unsigned long)GetCurrentProcessId());
 
     g_map = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
-                               0, sizeof(CanAttackStatus), mapName);
+                               0, sizeof(CombatStatus), mapName);
     if (g_map) {
-        g_status = (CanAttackStatus*)MapViewOfFile(g_map, FILE_MAP_ALL_ACCESS, 0, 0, 0);
+        g_status = (CombatStatus*)MapViewOfFile(g_map, FILE_MAP_ALL_ACCESS, 0, 0, 0);
     }
     if (!g_status) return 0;
 
@@ -1405,7 +1405,7 @@ static DWORD WINAPI JniWorker(LPVOID)
 //--------------------------------------------------------------------------
 extern "C" {
 
-__declspec(dllexport) BOOL WINAPI CanAttackNow(void)
+__declspec(dllexport) BOOL WINAPI GetCanAttackNow(void)
 {
     return (g_status && g_status->ready) ? (BOOL)g_status->canAttack : FALSE;
 }
@@ -1415,7 +1415,7 @@ __declspec(dllexport) BOOL WINAPI IsJniReady(void)
     return g_status ? (BOOL)g_status->ready : FALSE;
 }
 
-__declspec(dllexport) BOOL WINAPI GetCanAttackStatus(CanAttackStatus* out)
+__declspec(dllexport) BOOL WINAPI GetCombatStatus(CombatStatus* out)
 {
     if (!out || !g_status) return FALSE;
     *out = *g_status;
@@ -1439,7 +1439,7 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
         snprintf(mapName, sizeof(mapName), kMapNameFmt, (unsigned long)GetCurrentProcessId());
         HANDLE existing = OpenFileMappingA(FILE_MAP_READ, FALSE, mapName);
         if (existing) {
-            CanAttackStatus* st = (CanAttackStatus*)MapViewOfFile(existing, FILE_MAP_READ, 0, 0, 0);
+            CombatStatus* st = (CombatStatus*)MapViewOfFile(existing, FILE_MAP_READ, 0, 0, 0);
             bool healthy = st && (st->ready || st->tick > 0);
             if (st) UnmapViewOfFile(st);
             CloseHandle(existing);
