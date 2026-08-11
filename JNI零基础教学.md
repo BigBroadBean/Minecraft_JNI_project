@@ -1,6 +1,6 @@
 # Minecraft 1.8.9 · JNI 注入工具 —— 零基础教学文档
 
-> 配套项目：`MCCanAttack-JNI/`（桌面文件夹）
+> 配套项目：`MCCombatStatus-JNI/`（桌面文件夹原名为 MCCanAttack-JNI，DLL 仍叫 MCCanAttackJni.dll）
 > 本文从"完全不懂 JNI"开始，一步一步带你搞懂：Java 程序怎么跑、JNI 是什么、
 > DLL 注入是什么、以及我们的工具每一行代码在干什么。
 > 学完你可以自己改代码，做出"读取玩家坐标""读取目标血量"等新功能。
@@ -101,7 +101,7 @@ Mojang 发布的 Minecraft 是**混淆过**的：类名、字段名、方法名�
 > ⚠️ 关键结论：**注入后我们面对的是运行中的真实 jar**，不同环境下名字不同：
 > - 1.8.9 原版 → 混淆名；MCP 反混淆客户端 → MCP 名；Forge 1.8.9 → 混淆类名 + SRG 成员名
 > - 1.20.1 原版/Fabric → 官方混淆名；Forge/NeoForge 1.20.1 → Mojang 官方名
-> 所以我们的工具准备 **5 套映射表**，按顺序自动尝试（见第 6.7 节）。
+> 所以我们的工具准备 **10 套映射表**，按顺序自动尝试（见第 6.7 节）。
 
 ### 1.3 什么是 JNI（Java Native Interface）
 
@@ -943,17 +943,22 @@ javap -p ave.class             :: 用 JDK 自带的反编译工具看成员
 
 **③ 写进 JniMap 表**，然后照 6.3 的模式加解析和读取代码。
 
-### 6.7 多版本适配：本项目 5 套映射是怎么来的
+### 6.7 多版本适配：本项目 10 套映射是怎么来的
 
-项目当前按顺序自动尝试 5 套映射（`src/MCCanAttackJni.cpp` 里的 `kAllMaps[]`）：
+项目当前按顺序自动尝试 10 套映射（`src/MCCanAttackJni.cpp` 里的 `kAllMaps[]`）：
 
 | # | 标识 | 适用环境 | 关键名字示例 |
 |---|---|---|---|
 | 1 | `mcp189` | MCP 反混淆 1.8.9 | `thePlayer` / `getMinecraft` / `canAttackWithItem` |
 | 2 | `vanilla189` | 原版 1.8.9 | `ave` `h` `s` / `A()` / `aD` `ai` |
-| 3 | `forge189` | Forge 1.8.9 | `ave` + `field_71439_g` / `func_71410_x` |
-| 4 | `vanilla1201` | 原版/Fabric 1.20.1 | `enn` `t` `w` / `N()` / `bs` `cn` |
-| 5 | `forge1201` | Forge/NeoForge 1.20.1 | `getInstance` / `player` / `hitResult` / `isAlive` |
+| 3 | `forge189` | Forge 1.8.9（少见形态） | `ave` + `field_71439_g` / `func_71410_x` |
+| 4 | `forge189mcp` | **Forge 1.8.9 标准**（真机实测） | MCP 类名 + `func_71410_x` / `field_71439_g` |
+| 5 | `forge1122` | **Forge 1.12.2**（真机实测） | MCP 类名 + SRG 成员（`func_184614_ca` 取手持） |
+| 6 | `vanilla1122` | **原版 1.12.2**（真机实测） | `bib` `h` `s` / `z()` / `vp` `vp` |
+| 7 | `vanilla1201` | **原版/Fabric 1.20.1**（真机实测） | `enn` `t` `w` / `N()` / `eO()` |
+| 8 | `forge1201obf` | Forge/NeoForge 1.20.1（理论形态） | Mojang 类名 + 混淆成员 |
+| 9 | `forge1201stb` | **Forge/NeoForge 1.20.1 标准**（真机实测） | Mojang 类名 + `m_91087_` / `m_21205_` |
+| 10 | `forge1201` | Forge/NeoForge 1.20.1（其他形态） | `getInstance` / `player` / `hitResult` / `isAlive` |
 
 每套映射其实就是一张"名字字典"（`JniMap` 结构体），解析时从头到尾
 依次尝试，第一套全部解析成功的就生效（状态里的 `map=` 字段可看到）。
@@ -972,7 +977,7 @@ javap -p ave.class             :: 用 JDK 自带的反编译工具看成员
 
 > 想支持其他版本（如 1.19.2、1.20.4）：下载对应版本的官方映射文件，
 > 用同样的方法查表，在 `kAllMaps[]` 里加一套即可。
-> 1.17+ 的 Forge/NeoForge 都是 Mojang 官方名，大概率直接复用第 5 套。
+> 1.17+ 的 Forge/NeoForge 都是 Mojang 官方名，大概率直接复用第 9/10 套。
 
 ---
 
@@ -1108,7 +1113,7 @@ JNI 返回的 `jobject` 是"引用"，不是对象地址本身；
 | 实体 ID 方法 | （在 pk 上） | `func_145782_y` | `getEntityId` |
 | 距离方法 | （在 pk 上） | `func_70032_d` | `getDistanceToEntity` |
 
-### 1.20.1 名字对照（本项目第 4/5 套映射）
+### 1.20.1 名字对照（本项目第 7/10 套映射）
 
 > 已通过 Mojang 官方映射文件 + jar 反编译双重验证（见 `verify/`）。
 > 原版/Fabric 运行时用混淆名（`vanilla1201` 表），Forge/NeoForge 运行时用官方名（`forge1201` 表）。

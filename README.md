@@ -1,4 +1,8 @@
-# MCCanAttack-JNI — Minecraft 能否攻击/手持放置物检测工具 (C++ JNI DLL 注入)
+# MCCombatStatus-JNI — Minecraft 战斗状态检测工具 (C++ JNI DLL 注入)
+
+> 原项目名 **MCCanAttack-JNI**（本仓库/目录沿用历史名称，仅展示名更新）。
+> 外部接口（DLL 文件名 `MCCanAttackJni.dll`、共享内存 `Local\MCCanAttackStatus_<pid>`、
+> 导出函数）**保持不变**，现有调用方无需改动。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -48,7 +52,7 @@ canPlace = (player.getHeldItem() / getMainHandItem() != null)   // 手持有物�
 ```
 
 `canPlace` 只依赖玩家手持物品，与准星无关（未瞄准时仍正常上报）。
-放置物成员在 9 套映射中为**可选解析**——某环境下解析失败仅 `canPlace`
+放置物成员在 10 套映射中为**可选解析**——某环境下解析失败仅 `canPlace`
 恒为 0，**不影响 canAttack**。
 
 ## 文件结构
@@ -60,9 +64,9 @@ MCCanAttack-JNI/
 ├── injector.exe              注入器 (注入即退出, 无显示)
 ├── include/                  JNI/JVMTI 头文件
 ├── src/
-│   ├── MCCanAttackJni.cpp    注入 DLL 源码 (9 套映射表 + 环境探测 + UDP 上报)
+│   ├── MCCanAttackJni.cpp    注入 DLL 源码 (10 套映射表 + 环境探测 + UDP 上报)
 │   └── injector.cpp          注入器源码
-├── test/                     假客户端测试 (5 种命名体系各一套)
+├── test/                     假客户端测试 (7 套: 各命名体系一套)
 ├── verify/                   验证工具 (jmap/jcmd 记录等)
 ├── JNI零基础教学.md           零基础入门教程
 ├── 技术文档.md                总思路 + 架构原理 + 调试历程 + Forge 规律
@@ -142,7 +146,7 @@ build.bat
    `CreateRemoteThread + LoadLibraryA` 注入 `MCCanAttackJni.dll`。
 2. DLL 内工作线程通过 `JNI_GetCreatedJavaVMs` 拿到 JavaVM 并 `AttachCurrentThread`，
    找到游戏类加载器（`Launch.classLoader`，注意字段类型是 `LaunchClassLoader`！），
-   用 JNI 反射解析 Minecraft 类/字段/方法 ID（9 套映射依次尝试）。
+   用 JNI 反射解析 Minecraft 类/字段/方法 ID（10 套映射依次尝试）。
 3. 每 5ms 计算一次 canAttack / canPlace，通过 UDP 向本机 35785 端口
    发送 2 字节 (byte0=canAttack, byte1=canPlace)，并写入共享内存
    `Local\MCCanAttackStatus_<pid>`。
