@@ -19,7 +19,7 @@ BlockItem），通过 UDP 向本机 35785 端口持续上报 2 字节：
 | `forge189` | Forge 1.8.9（类名混淆+成员SRG，少见形态） | 混淆类名 + SRG 成员 | 假客户端测试 ✅ |
 | `forge189mcp` | **Forge 1.8.9 标准运行时** | **MCP 类名 + SRG 成员** | **真机实测 ✅ (PCL+OptiFine)** |
 | `forge1122` | **Forge 1.12.2** | **MCP 类名 + SRG 成员**（RayTraceResult 改名；1.9+ 双持用 getHeldItemMainhand） | **真机实测 ✅** |
-| `vanilla1122` | **原版启动器 1.12.2** | 混淆名 (bib/z/h/s) | 假客户端测试 ✅ + deobfuscation lzma 核对 |
+| `vanilla1122` | **原版启动器 1.12.2** | 混淆名 (bib/z/h/s) | **真机实测 ✅** + deobfuscation lzma 核对 |
 | `vanilla1201` | 原版 / Fabric 1.20.1 | 官方混淆名 | 假客户端测试 ✅ + Mojang 官方映射核对 |
 | `forge1201obf` | Forge/NeoForge 1.20.1（理论形态） | Mojang 类名 + 混淆成员 | 假客户端测试 ✅ |
 | `forge1201stb` | **Forge/NeoForge 1.20.1 标准运行时** | **Mojang 类名 + MCP stable 成员** | **真机实测 ✅** |
