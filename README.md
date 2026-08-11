@@ -19,12 +19,13 @@ BlockItem），通过 UDP 向本机 35785 端口持续上报 2 字节：
 | `forge189` | Forge 1.8.9（类名混淆+成员SRG，少见形态） | 混淆类名 + SRG 成员 | 假客户端测试 ✅ |
 | `forge189mcp` | **Forge 1.8.9 标准运行时** | **MCP 类名 + SRG 成员** | **真机实测 ✅ (PCL+OptiFine)** |
 | `forge1122` | **Forge 1.12.2** | **MCP 类名 + SRG 成员**（RayTraceResult 改名；1.9+ 双持用 getHeldItemMainhand） | **真机实测 ✅** |
+| `vanilla1122` | **原版启动器 1.12.2** | 混淆名 (bib/z/h/s) | 假客户端测试 ✅ + deobfuscation lzma 核对 |
 | `vanilla1201` | 原版 / Fabric 1.20.1 | 官方混淆名 | 假客户端测试 ✅ + Mojang 官方映射核对 |
 | `forge1201obf` | Forge/NeoForge 1.20.1（理论形态） | Mojang 类名 + 混淆成员 | 假客户端测试 ✅ |
 | `forge1201stb` | **Forge/NeoForge 1.20.1 标准运行时** | **Mojang 类名 + MCP stable 成员** | **真机实测 ✅** |
 | `forge1201` | Forge/NeoForge 1.20.1（其他形态） | Mojang 官方名 | 假客户端测试 ✅ + Mojang 官方映射核对 |
 
-DLL 按上表顺序自动尝试 8 套命名，**无需任何配置**。注入后 `map=` 字段显示命中的体系。
+DLL 按上表顺序自动尝试 10 套命名，**无需任何配置**。注入后 `map=` 字段显示命中的体系。
 
 > **重要发现（真机实测）**：
 > - **Forge 1.8.9**：FML 运行时反混淆 = **类名转 MCP 名**（`net.minecraft.client.Minecraft`）+ **成员转 SRG 名**（`func_71410_x`）
@@ -106,8 +107,8 @@ MCCanAttack-JNI/
 
 ## 测试方法（不需要开真实游戏）
 
-`test/` 下有 6 套假客户端，分别模拟 6 种运行时的类名/成员名结构
-（mcp189 / vanilla189 / forge189 / forge1122 / vanilla1201 / forge1201）。
+`test/` 下有 7 套假客户端，分别模拟 7 种运行时的类名/成员名结构
+（mcp189 / vanilla189 / forge189 / forge1122 / vanilla1122 / vanilla1201 / forge1201）。
 以 forge1201 为例：
 
 ```bat

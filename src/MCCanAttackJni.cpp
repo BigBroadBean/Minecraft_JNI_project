@@ -13,15 +13,16 @@
 //      byte1 = 0x31 '1'=手持放置物 / 0x30 '0'=不是/空手
 //  (byte0 与旧版 1 字节协议完全一致, 旧接收端无需改动)
 //
-//  支持 9 套命名体系 (按顺序自动尝试), 其中放置物判定成员为
+//  支持 10 套命名体系 (按顺序自动尝试), 其中放置物判定成员为
 //  "可选解析" —— 解析失败仅 canPlace 恒为 0, 绝不拖垮 canAttack:
 //    1. mcp189      MCP 反混淆客户端 1.8.9 (MCP 名)
 //    2. vanilla189  原版混淆客户端 1.8.9 (obfuscated 名)
 //    3. forge189    Forge 1.8.9 运行时 (类=混淆名, 成员=SRG 名)
 //    4. forge189mcp Forge 1.8.9 运行时 (类=MCP 名, 成员=SRG 名)
 //    5. forge1122   Forge 1.12.2 运行时 (类=MCP 名, 成员=SRG 名)
-//    6. vanilla1201 原版/Fabric 1.20.1 运行时 (官方混淆名)
-//    7. forge1201obf/8. forge1201stb/9. forge1201 (Forge/NeoForge 1.20.1 三形态)
+//    6. vanilla1122 原版混淆客户端 1.12.2 (obfuscated 名)
+//    7. vanilla1201 原版/Fabric 1.20.1 运行时 (官方混淆名)
+//    8. forge1201obf/9. forge1201stb/10. forge1201 (Forge/NeoForge 1.20.1 三形态)
 //
 //  导出函数:
 //    BOOL CanAttackNow(void)          -- 直接返回当前是否能攻击
@@ -61,7 +62,7 @@ struct CanAttackStatus {
     char          envName[48];     // 环境探测结果 (forge/optifine/fabric/launchwrapper)
     char          loaderName[48];  // 使用的游戏类加载器类名
     char          errMsg[96];      // 最近一次错误详情 (类名/异常信息)
-    char          failLog[160];    // 最近一轮 9 套映射的失败原因汇总
+    char          failLog[160];    // 最近一轮 10 套映射的失败原因汇总
     volatile LONG mcNull;          // 1 = getMinecraft() 返回 null (双份类副本问题)
     volatile LONG tick;            // 更新计数
     volatile LONG lastError;       // 最近一次错误码, 0=无错误
@@ -250,6 +251,29 @@ static const JniMap kForge1122Map = {
     "net/minecraft/item/ItemBlock",
 };
 
+// ---- 3d. 原版混淆客户端 1.12.2 (obfuscated 名; 类名与 1.8.9 全不同!
+//       1.9+ 双持: 取手持用 co=getHeldItemMainhand, 无参 getHeldItem 已移除)
+//  (混淆名来自 deobfuscation_data-1.12.2.lzma: CL: bib Minecraft / CL: vg Entity
+//   / CL: vp LivingBase / CL: bud EntityPlayerSP / CL: bhc RayTraceResult) ----
+static const JniMap kVanilla1122Map = {
+    "vanilla1122",
+    "bib", "()Lbib;", "z",
+    "h", "Lbud;",
+    "s", "Lbhc;",
+    "bhc",
+    "a", NULL, "Lbhc$a;",
+    NULL,
+    "d", NULL, "Lvg;",
+    "bhc$a",
+    "c", NULL, "Lbhc$a;",
+    "vg",
+    "bd", "aC", NULL,
+    "vp",
+    "co", "()Laip;",
+    "aip", "c", "()Lain;",
+    "ahb",
+};
+
 // ---- 4. 原版/Fabric 1.20.1 (官方混淆名, 经 Mojang 官方映射验证) ----
 static const JniMap kVanilla1201Map = {
     "vanilla1201",
@@ -337,7 +361,8 @@ static const JniMap kOfficial1201Map = {
 
 static const JniMap* kAllMaps[] = {
     &kMcpMap, &kVanilla189Map, &kForge189Map, &kForge189McpMap, &kForge1122Map,
-    &kVanilla1201Map, &kForge1201ObfMap, &kForge1201StableMap, &kOfficial1201Map,
+    &kVanilla1122Map, &kVanilla1201Map, &kForge1201ObfMap, &kForge1201StableMap,
+    &kOfficial1201Map,
 };
 static const int kMapCount = (int)(sizeof(kAllMaps) / sizeof(kAllMaps[0]));
 
@@ -1264,7 +1289,7 @@ static DWORD WINAPI JniWorker(LPVOID)
 
     while (!g_stop) {
         if (!res.ok) {
-            // 尚未解析成功: 依次尝试 9 套映射, 每 500ms 重试一轮
+            // 尚未解析成功: 依次尝试 10 套映射, 每 500ms 重试一轮
             // (游戏类可能还在加载)
             jobject loader = useGameLoader ? gameLoader : sysLoader;
             g_status->failLog[0] = 0; // 每轮清空失败汇总
