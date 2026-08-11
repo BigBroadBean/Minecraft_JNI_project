@@ -24,3 +24,6 @@ test/*/out/
 # ===== 系统文件 =====
 Thumbs.db
 Desktop.ini
+
+# ===== 工具运行目录 =====
+.zcode/

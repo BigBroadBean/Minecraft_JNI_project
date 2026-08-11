@@ -5,21 +5,28 @@
 //  功能: 每 5ms 读取一次:
 //      Minecraft.getMinecraft().thePlayer / player
 //      Minecraft.getMinecraft().objectMouseOver / hitResult
-//  判断玩家当前是否 "瞄准到了一个可以攻击的生物", 并把结果写入
-//  共享内存 (Local\MCCanAttackStatus_<pid>), 同时通过 UDP 向本机
-//  35785 端口发送 1 字节 (0x31='1'=可以攻击 / 0x30='0'=不可以)。
+//  判断玩家当前是否 "瞄准到了一个可以攻击的生物" (canAttack), 以及
+//  "手持物品是否为放置物" (canPlace, ItemBlock/BlockItem), 并把结果
+//  写入共享内存 (Local\MCCanAttackStatus_<pid>), 同时通过 UDP 向本机
+//  35785 端口发送 2 字节:
+//      byte0 = 0x31 '1'=可以攻击 / 0x30 '0'=不可以
+//      byte1 = 0x31 '1'=手持放置物 / 0x30 '0'=不是/空手
+//  (byte0 与旧版 1 字节协议完全一致, 旧接收端无需改动)
 //
-//  支持 5 套命名体系 (按顺序自动尝试):
+//  支持 9 套命名体系 (按顺序自动尝试), 其中放置物判定成员为
+//  "可选解析" —— 解析失败仅 canPlace 恒为 0, 绝不拖垮 canAttack:
 //    1. mcp189      MCP 反混淆客户端 1.8.9 (MCP 名)
 //    2. vanilla189  原版混淆客户端 1.8.9 (obfuscated 名)
 //    3. forge189    Forge 1.8.9 运行时 (类=混淆名, 成员=SRG 名)
-//    4. vanilla1201 原版/Fabric 1.20.1 运行时 (官方混淆名)
-//    5. forge1201   Forge/NeoForge 1.20.1 运行时 (Mojang 官方名)
+//    4. forge189mcp Forge 1.8.9 运行时 (类=MCP 名, 成员=SRG 名)
+//    5. forge1122   Forge 1.12.2 运行时 (类=MCP 名, 成员=SRG 名)
+//    6. vanilla1201 原版/Fabric 1.20.1 运行时 (官方混淆名)
+//    7. forge1201obf/8. forge1201stb/9. forge1201 (Forge/NeoForge 1.20.1 三形态)
 //
 //  导出函数:
 //    BOOL CanAttackNow(void)          -- 直接返回当前是否能攻击
 //    BOOL IsJniReady(void)            -- JNI 是否已解析成功
-//    BOOL GetCanAttackStatus(Status*) -- 拷贝完整状态结构
+//    BOOL GetCanAttackStatus(Status*) -- 拷贝完整状态结构 (含 canPlace)
 //============================================================================
 
 #define WIN32_LEAN_AND_MEAN
@@ -36,21 +43,25 @@
 #pragma pack(push, 1)
 struct CanAttackStatus {
     DWORD        magic;            // 0x4D43414B = 'MCAK'
-    DWORD        version;          // 3
+    DWORD        version;          // 6
     DWORD        pid;              // 被注入进程的 PID
     volatile LONG ready;           // JNI 解析是否成功
     volatile LONG inGame;          // 是否已进入游戏 (mc && player != null)
-    volatile LONG canAttack;       // 核心结果: 当前是否能攻击
+    volatile LONG canAttack;       // 核心结果1: 当前是否能攻击
+    volatile LONG canPlace;        // 核心结果2: 手持物品是否为放置物 (ItemBlock/BlockItem)
+    volatile LONG placeReady;      // 放置物判定链是否解析成功 (0=未启用, canPlace 恒 0)
     volatile LONG hitType;         // 0=未命中 1=命中方块 2=命中实体
     volatile LONG targetLiving;    // 目标是否为 LivingEntity
     volatile LONG targetAlive;     // 目标是否存活
     volatile LONG targetIsPlayer;  // 目标是否是玩家自己
+    volatile LONG heldItemNull;    // 1 = 手持为空 (null), 0 = 手持有物品
     char          targetName[128]; // 目标的类名 (如 EntityZombie / pr / bfj)
+    char          heldItemName[64];// 手持物品的 Item 类名 (如 ItemBlock / yo / cds)
     char          mappingName[32]; // 命中的命名体系 (如 forge1201)
     char          envName[48];     // 环境探测结果 (forge/optifine/fabric/launchwrapper)
     char          loaderName[48];  // 使用的游戏类加载器类名
     char          errMsg[96];      // 最近一次错误详情 (类名/异常信息)
-    char          failLog[160];    // 最近一轮 5 套映射的失败原因汇总
+    char          failLog[160];    // 最近一轮 9 套映射的失败原因汇总
     volatile LONG mcNull;          // 1 = getMinecraft() 返回 null (双份类副本问题)
     volatile LONG tick;            // 更新计数
     volatile LONG lastError;       // 最近一次错误码, 0=无错误
@@ -59,7 +70,7 @@ struct CanAttackStatus {
 
 static const char* kMapNameFmt = "Local\\MCCanAttackStatus_%lu";
 static const DWORD kMagic      = 0x4D43414B;
-static const DWORD kVersion    = 4;
+static const DWORD kVersion    = 6;
 
 static HANDLE           g_map    = NULL;
 static CanAttackStatus* g_status = NULL;
@@ -125,6 +136,13 @@ struct JniMap {
     const char* isAliveMethod;
     const char* isAttackable;      // NULL = 跳过
     const char* livingClass;
+    // ---- 放置物判定 (全部可选: 解析失败仅 canPlace=0, 不拖垮 canAttack) ----
+    const char* heldItemGetter;    // 玩家类上取手持物品的方法 (1.8.9: getHeldItem/bA/func_70694_bm; 1.20.1: getMainHandItem/eO/m_21205_)
+    const char* heldItemSig;       // heldItemGetter 签名 (返回 ItemStack)
+    const char* itemStackClass;    // ItemStack 类 (1.8.9: net/.../ItemStack/zx; 1.20.1: net/.../ItemStack/cfz)
+    const char* itemGetItem;       // ItemStack.getItem (1.8.9: getItem/b/func_77973_b; 1.20.1: getItem/d/m_41720_)
+    const char* itemGetItemSig;    // itemGetItem 签名 (返回 Item)
+    const char* itemBlockClass;    // ItemBlock/BlockItem 类 (1.8.9: net/.../ItemBlock/yo; 1.20.1: net/.../BlockItem/cds)
 };
 
 // ---- 1. MCP 反混淆客户端 1.8.9 ----
@@ -142,6 +160,9 @@ static const JniMap kMcpMap = {
     "net/minecraft/entity/Entity",
     "canAttackWithItem", "isEntityAlive", NULL,
     "net/minecraft/entity/EntityLivingBase",
+    "getHeldItem", "()Lnet/minecraft/item/ItemStack;",
+    "net/minecraft/item/ItemStack", "getItem", "()Lnet/minecraft/item/Item;",
+    "net/minecraft/item/ItemBlock",
 };
 
 // ---- 2. 原版混淆客户端 1.8.9 ----
@@ -159,6 +180,9 @@ static const JniMap kVanilla189Map = {
     "pk",
     "aD", "ai", NULL,
     "pr",
+    "bA", "()Lzx;",
+    "zx", "b", "()Lzw;",
+    "yo",
 };
 
 // ---- 3. Forge 1.8.9 (类=混淆名, 成员=SRG 名) ----
@@ -176,6 +200,9 @@ static const JniMap kForge189Map = {
     "pk",
     "func_70075_an", "func_70089_S", NULL,
     "pr",
+    "func_70694_bm", "()Lzx;",
+    "zx", "func_77973_b", "()Lzw;",
+    "yo",
 };
 
 // ---- 3b. Forge 1.8.9 (FML 运行时反混淆: 类名=MCP 名, 成员=SRG 名) ----
@@ -194,10 +221,15 @@ static const JniMap kForge189McpMap = {
     "net/minecraft/entity/Entity",
     "func_70075_an", "func_70089_S", NULL,
     "net/minecraft/entity/EntityLivingBase",
+    "func_70694_bm", "()Lnet/minecraft/item/ItemStack;",
+    "net/minecraft/item/ItemStack", "func_77973_b", "()Lnet/minecraft/item/Item;",
+    "net/minecraft/item/ItemBlock",
 };
 
 // ---- 3c. Forge 1.12.2 (类名=MCP 名, 成员=SRG 名; 与 forge189mcp 同形态,
-//       唯一区别: MovingObjectPosition 在 1.12 改名为 RayTraceResult!)
+//       差异: ① MovingObjectPosition 在 1.12 改名为 RayTraceResult!
+//              ② 1.9+ 引入双持, 无参 getHeldItem (func_70694_bm) 被移除,
+//                 改用 getHeldItemMainhand (func_184614_ca)!
 //  (真机实测: mccls:OK + 方法名 func_xxx; 映射来自 deobfuscation_data-1.12.2.lzma) ----
 static const JniMap kForge1122Map = {
     "forge1122",
@@ -213,6 +245,9 @@ static const JniMap kForge1122Map = {
     "net/minecraft/entity/Entity",
     "func_70075_an", "func_70089_S", NULL,
     "net/minecraft/entity/EntityLivingBase",
+    "func_184614_ca", "()Lnet/minecraft/item/ItemStack;",
+    "net/minecraft/item/ItemStack", "func_77973_b", "()Lnet/minecraft/item/Item;",
+    "net/minecraft/item/ItemBlock",
 };
 
 // ---- 4. 原版/Fabric 1.20.1 (官方混淆名, 经 Mojang 官方映射验证) ----
@@ -230,6 +265,9 @@ static const JniMap kVanilla1201Map = {
     "bfj",
     NULL, "bs", "cn",
     "bfz",
+    "eO", "()Lcfz;",
+    "cfz", "d", "()Lcfu;",
+    "cds",
 };
 
 // ---- 4b. Forge/NeoForge 1.20.1 (类名=Mojang 官方名, 成员=混淆名) ----
@@ -249,6 +287,9 @@ static const JniMap kForge1201ObfMap = {
     "net/minecraft/world/entity/Entity",
     NULL, "bs", "cn",
     "net/minecraft/world/entity/LivingEntity",
+    "eO", "()Lnet/minecraft/world/item/ItemStack;",
+    "net/minecraft/world/item/ItemStack", "d", "()Lnet/minecraft/world/item/Item;",
+    "net/minecraft/world/item/BlockItem",
 };
 
 // ---- 4c. Forge/NeoForge 1.20.1 (类名=Mojang 官方名, 成员=MCP stable 名) ----
@@ -269,6 +310,9 @@ static const JniMap kForge1201StableMap = {
     "net/minecraft/world/entity/Entity",
     NULL, "m_6084_", "m_6097_",
     "net/minecraft/world/entity/LivingEntity",
+    "m_21205_", "()Lnet/minecraft/world/item/ItemStack;",
+    "net/minecraft/world/item/ItemStack", "m_41720_", "()Lnet/minecraft/world/item/Item;",
+    "net/minecraft/world/item/BlockItem",
 };
 
 // ---- 5. Forge/NeoForge 1.20.1 (Mojang 官方名) ----
@@ -286,6 +330,9 @@ static const JniMap kOfficial1201Map = {
     "net/minecraft/world/entity/Entity",
     NULL, "isAlive", "isAttackable",
     "net/minecraft/world/entity/LivingEntity",
+    "getMainHandItem", "()Lnet/minecraft/world/item/ItemStack;",
+    "net/minecraft/world/item/ItemStack", "getItem", "()Lnet/minecraft/world/item/Item;",
+    "net/minecraft/world/item/BlockItem",
 };
 
 static const JniMap* kAllMaps[] = {
@@ -614,6 +661,12 @@ struct Resolved {
     jmethodID  getMinecraft, canAttackWithItem, isAliveMethod, isAttackable, classGetName;
     jmethodID  typeOfHitGetter, entityHitGetter;
     jfieldID   thePlayerField, mopField, typeOfHitField, entityHitField, entityConstField;
+    // ---- 放置物判定 (可选: 全部为 NULL 时 canPlace 恒 0, 不影响 canAttack) ----
+    bool       placeOk;           // 放置物判定链是否解析成功 (诊断用)
+    jclass     itemStackCls;      // ItemStack 类
+    jclass     itemBlockCls;      // ItemBlock/BlockItem 类
+    jmethodID  heldItemGetter;    // player.getHeldItem()/getMainHandItem()
+    jmethodID  itemGetItem;       // stack.getItem()
 };
 
 //--------------------------------------------------------------------------
@@ -712,6 +765,32 @@ static bool ResolveWith(JNIEnv* env, const JniMap& m, Resolved& r,
     }
     if (!entC) { env->ExceptionClear(); return false; }
 
+    // ---- 放置物判定成员: 全部可选解析 (失败仅 canPlace=0, 不拖垮 canAttack) ----
+    // 注意: 解析失败只清异常 + 留 NULL, 不 return false。
+    // 需要的 ID: 玩家类上的 heldItemGetter + ItemStack 类 + stack.getItem + ItemBlock 类。
+    // 判定用 IsInstanceOf(getItem() 返回值, itemBlockCls), 不需要单独的 Item 基类。
+    jclass    itemStackCls = NULL;
+    jclass    itemBlockCls = NULL;
+    jmethodID heldGetter   = NULL;
+    jmethodID getItem      = NULL;
+    if (m.heldItemGetter && m.itemStackClass && m.itemGetItem && m.itemBlockClass) {
+        heldGetter = env->GetMethodID(liv, m.heldItemGetter, m.heldItemSig);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); heldGetter = NULL; }
+        itemStackCls = LoadClass(env, m.itemStackClass, loader, clsCls, forName);
+        itemBlockCls = LoadClass(env, m.itemBlockClass, loader, clsCls, forName);
+        if (itemStackCls) {
+            getItem = env->GetMethodID(itemStackCls, m.itemGetItem, m.itemGetItemSig);
+            if (env->ExceptionCheck()) { env->ExceptionClear(); getItem = NULL; }
+        }
+        // 任一环节失败 -> 整体放弃放置物检测 (失败时统一留 NULL)
+        if (!heldGetter || !itemStackCls || !getItem || !itemBlockCls) {
+            if (itemStackCls) env->DeleteLocalRef(itemStackCls);
+            if (itemBlockCls) env->DeleteLocalRef(itemBlockCls);
+            itemStackCls = NULL; itemBlockCls = NULL;
+            heldGetter = NULL; getItem = NULL;
+        }
+    }
+
     r.ok               = true;
     r.name             = m.name;
     r.mcClass          = mc;
@@ -733,6 +812,12 @@ static bool ResolveWith(JNIEnv* env, const JniMap& m, Resolved& r,
     r.entityHitGetter  = entG;
     r.entityHitField   = entF;
     r.entityConstField = entC;
+    // 放置物判定 (可选, 可能全为 NULL -> canPlace 恒 0)
+    r.placeOk          = (heldGetter && itemStackCls && getItem && itemBlockCls);
+    r.itemStackCls     = itemStackCls;
+    r.itemBlockCls     = itemBlockCls;
+    r.heldItemGetter   = heldGetter;
+    r.itemGetItem      = getItem;
     return true;
 }
 
@@ -750,13 +835,17 @@ static void CopyName(char* dst, size_t cap, const char* src)
 }
 
 //--------------------------------------------------------------------------
-// UDP 上报: 向本机 35785 端口发送 1 字节 (0x31='1'=可以攻击 / 0x30='0'=不可以)
+// UDP 上报: 向本机 35785 端口发送 2 字节 [canAttack][canPlace]
+//   byte0: 0x31 '1'=可以攻击 / 0x30 '0'=不可以   (与旧版 1 字节协议兼容)
+//   byte1: 0x31 '1'=手持放置物 / 0x30 '0'=不是或空手
 //--------------------------------------------------------------------------
-static void SendCanAttack(int canAttack)
+static void SendStatus(int canAttack, int canPlace)
 {
     if (g_sock == INVALID_SOCKET) return;
-    char b = canAttack ? '1' : '0';
-    sendto(g_sock, &b, 1, 0, (const struct sockaddr*)&g_dst, sizeof(g_dst));
+    char b[2];
+    b[0] = canAttack ? '1' : '0';
+    b[1] = canPlace  ? '1' : '0';
+    sendto(g_sock, b, 2, 0, (const struct sockaddr*)&g_dst, sizeof(g_dst));
 }
 
 //--------------------------------------------------------------------------
@@ -788,6 +877,9 @@ static void UpdateStatus(JNIEnv* env, const Resolved& r)
         // 游戏尚未初始化 (主类未加载 / 双份类副本问题)
         g_status->inGame    = 0;
         g_status->canAttack = 0;
+        g_status->canPlace  = 0;
+        g_status->placeReady = 0;
+        g_status->heldItemNull = 0;
         g_status->hitType   = 0;
         g_status->mcNull    = 1;   // 标记: getMinecraft() 拿不到对象
         g_status->tick++;          // 即使拿不到主类也计数, 便于判断 worker 是否存活
@@ -802,13 +894,67 @@ static void UpdateStatus(JNIEnv* env, const Resolved& r)
 
     g_status->inGame = (player != NULL);
 
-    if (!player || !mop) {
+    if (!player) {
+        // 未进入游戏 (无玩家): 全部清零 (canPlace 也依赖 player, 无法计算)
+        g_status->canAttack      = 0;
+        g_status->canPlace       = 0;
+        g_status->placeReady     = 0;
+        g_status->heldItemNull   = 0;
+        g_status->hitType        = 0;
+        g_status->targetLiving   = 0;
+        g_status->targetAlive    = 0;
+        g_status->targetIsPlayer = 0;
+        CopyName(g_status->targetName, sizeof(g_status->targetName), NULL);
+        CopyName(g_status->heldItemName, sizeof(g_status->heldItemName), NULL);
+        g_status->tick++;
+        env->PopLocalFrame(NULL);
+        return;
+    }
+
+    // ---- 放置物判定: 手持物品是否为 ItemBlock/BlockItem ----
+    // 只依赖 player (手持), 与准星/mop 无关; 在 mop 检查之前计算。
+    // 链: player.getHeldItem()/getMainHandItem() -> stack.getItem() -> instanceof itemBlockCls
+    // 可选解析: 任一 ID 为 NULL (解析失败) 时 canPlace 恒 0, 不影响 canAttack。
+    g_status->placeReady = r.placeOk ? 1 : 0; // 诊断: 放置物链是否解析成功
+    LONG canPlace    = 0;
+    LONG heldNull    = 1; // 默认空手
+    CopyName(g_status->heldItemName, sizeof(g_status->heldItemName), NULL);
+    if (r.heldItemGetter && r.itemStackCls && r.itemGetItem && r.itemBlockCls) {
+        jobject stack = env->CallObjectMethod(player, r.heldItemGetter);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); g_status->lastError = 110; }
+        if (stack) {
+            heldNull = 0;
+            jobject item = env->CallObjectMethod(stack, r.itemGetItem);
+            if (env->ExceptionCheck()) { env->ExceptionClear(); g_status->lastError = 111; }
+            if (item) {
+                canPlace = env->IsInstanceOf(item, r.itemBlockCls) ? 1 : 0;
+                // 手持物品的 Item 类名 (如 ItemBlock / yo / cds), 便于调试
+                jobject cls = env->GetObjectClass(item);
+                jstring nm  = (jstring)env->CallObjectMethod(cls, r.classGetName);
+                if (env->ExceptionCheck()) { env->ExceptionClear(); g_status->lastError = 112; }
+                const char* utf = nm ? env->GetStringUTFChars(nm, NULL) : NULL;
+                if (utf) {
+                    CopyName(g_status->heldItemName, sizeof(g_status->heldItemName), utf);
+                    env->ReleaseStringUTFChars(nm, utf);
+                }
+                env->DeleteLocalRef(cls);
+                if (nm) env->DeleteLocalRef(nm);
+                env->DeleteLocalRef(item);
+            }
+            env->DeleteLocalRef(stack);
+        }
+    }
+
+    if (!mop) {
+        // 未瞄准: canAttack=0, 瞄准相关字段清零; canPlace/heldNull 保留 (独立检测)
         g_status->canAttack      = 0;
         g_status->hitType        = 0;
         g_status->targetLiving   = 0;
         g_status->targetAlive    = 0;
         g_status->targetIsPlayer = 0;
         CopyName(g_status->targetName, sizeof(g_status->targetName), NULL);
+        g_status->canPlace       = canPlace;
+        g_status->heldItemNull   = heldNull;
         g_status->tick++;
         env->PopLocalFrame(NULL);
         return;
@@ -879,6 +1025,8 @@ static void UpdateStatus(JNIEnv* env, const Resolved& r)
     g_status->targetAlive     = alive;
     g_status->targetIsPlayer  = isSelf;
     g_status->canAttack       = (hit == 2 && living && alive && !isSelf && canUseItem && attackable) ? 1 : 0;
+    g_status->canPlace        = canPlace;
+    g_status->heldItemNull    = heldNull;
     g_status->tick++;
 
     env->PopLocalFrame(NULL);
@@ -1116,7 +1264,7 @@ static DWORD WINAPI JniWorker(LPVOID)
 
     while (!g_stop) {
         if (!res.ok) {
-            // 尚未解析成功: 依次尝试 5 套映射, 每 500ms 重试一轮
+            // 尚未解析成功: 依次尝试 9 套映射, 每 500ms 重试一轮
             // (游戏类可能还在加载)
             jobject loader = useGameLoader ? gameLoader : sysLoader;
             g_status->failLog[0] = 0; // 每轮清空失败汇总
@@ -1197,8 +1345,9 @@ static DWORD WINAPI JniWorker(LPVOID)
             }
         }
         UpdateStatus(env, res);
-        // UDP 上报: 1 = 可以攻击, 0 = 不可以 (与检查同频, 每 5ms)
-        SendCanAttack(g_status ? g_status->canAttack : 0);
+        // UDP 上报: [byte0=可以攻击 1/0][byte1=手持放置物 1/0] (与检查同频, 每 5ms)
+        SendStatus(g_status ? g_status->canAttack : 0,
+                   g_status ? g_status->canPlace  : 0);
         // 若长期拿不到主类 (双份类副本), 自动切换加载器重新解析
         if (g_status->mcNull) {
             if (++nullMcStreak > 100) { // 连续 0.5 秒拿不到 mc (每 5ms 一次)

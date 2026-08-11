@@ -1,12 +1,14 @@
-# MCCanAttack-JNI — Minecraft 能否攻击检测工具 (C++ JNI DLL 注入)
+# MCCanAttack-JNI — Minecraft 能否攻击/手持放置物检测工具 (C++ JNI DLL 注入)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 通过向运行中的 Minecraft (java/javaw 进程) 注入 DLL，每 5ms 读取
 `Minecraft` 单例的 `thePlayer` / `objectMouseOver`，判断玩家当前
-**是否瞄准到了一个可以攻击的生物**，并通过 UDP 向本机 35785 端口
-持续上报 1 字节 (0x31='1'=可以攻击 / 0x30='0'=不可以)，同时把结果
-写入共享内存供外部程序读取。
+**是否瞄准到了一个可以攻击的生物**（`canAttack`），并检测**手持物品
+是否为放置物**（`canPlace`，1.8.9/1.12.2 的 ItemBlock / 1.20.1 的
+BlockItem），通过 UDP 向本机 35785 端口持续上报 2 字节：
+`[byte0=canAttack '1'/'0'][byte1=canPlace '1'/'0']`，同时把结果写入
+共享内存供外部程序读取。
 
 ## 支持的版本 / 客户端
 
@@ -16,7 +18,7 @@
 | `vanilla189` | 原版启动器 1.8.9 | 混淆名 (ave/A/h/s) | 假客户端测试 ✅ + 官方 jar 反编译核对 |
 | `forge189` | Forge 1.8.9（类名混淆+成员SRG，少见形态） | 混淆类名 + SRG 成员 | 假客户端测试 ✅ |
 | `forge189mcp` | **Forge 1.8.9 标准运行时** | **MCP 类名 + SRG 成员** | **真机实测 ✅ (PCL+OptiFine)** |
-| `forge1122` | **Forge 1.12.2** | **MCP 类名 + SRG 成员**（RayTraceResult 改名） | **真机实测 ✅** |
+| `forge1122` | **Forge 1.12.2** | **MCP 类名 + SRG 成员**（RayTraceResult 改名；1.9+ 双持用 getHeldItemMainhand） | **真机实测 ✅** |
 | `vanilla1201` | 原版 / Fabric 1.20.1 | 官方混淆名 | 假客户端测试 ✅ + Mojang 官方映射核对 |
 | `forge1201obf` | Forge/NeoForge 1.20.1（理论形态） | Mojang 类名 + 混淆成员 | 假客户端测试 ✅ |
 | `forge1201stb` | **Forge/NeoForge 1.20.1 标准运行时** | **Mojang 类名 + MCP stable 成员** | **真机实测 ✅** |
@@ -39,7 +41,14 @@ canAttack = (objectMouseOver != null)
          && (目标 != 玩家自己)
          && (canAttackWithItem() || 版本无此检查)  // 1.8.9: 手持物品能造成伤害
          && (isAttackable()  || 版本无此检查)      // 1.20.1: 目标可被攻击
+
+canPlace = (player.getHeldItem() / getMainHandItem() != null)   // 手持有物品
+        && (stack.getItem() instanceof ItemBlock / BlockItem)   // 是放置物
 ```
+
+`canPlace` 只依赖玩家手持物品，与准星无关（未瞄准时仍正常上报）。
+放置物成员在 9 套映射中为**可选解析**——某环境下解析失败仅 `canPlace`
+恒为 0，**不影响 canAttack**。
 
 ## 文件结构
 
@@ -70,8 +79,16 @@ MCCanAttack-JNI/
    injector.exe -title <子串>         按窗口标题查找 (默认 "Minecraft")
    ```
 3. DLL 注入后每 5ms 检测一次，并向本机 **35785 端口 (UDP)** 持续发送
-   1 字节：`0x31` ('1') = 当前可以攻击准星所指的生物，`0x30` ('0') = 不可以。
-   接收方无需应答，直接收 UDP 包即可。
+   2 字节：
+   ```
+   byte0 = 0x31 ('1') = 当前可以攻击准星所指的生物
+          0x30 ('0') = 不可以
+   byte1 = 0x31 ('1') = 手持物品是放置物 (ItemBlock/BlockItem)
+          0x30 ('0') = 不是或空手
+   ```
+   接收方无需应答，直接收 UDP 包即可。**byte0 与旧版 1 字节协议完全
+   一致**，旧接收端（只读 byte0）无需改动；新接收端 `recvfrom(2)`
+   一次拿到两个状态。
 
 > 旧版的实时状态显示与 probe.log 诊断日志已移除；需要调试信息时可通过
 > 共享内存 `Local\MCCanAttackStatus_<pid>` 读取（字段含义见下文）。
@@ -82,14 +99,15 @@ MCCanAttack-JNI/
 |---|---|
 | `BOOL CanAttackNow()` | 直接返回当前是否能攻击 |
 | `BOOL IsJniReady()` | JNI 是否已就绪 |
-| `BOOL GetCanAttackStatus(CanAttackStatus*)` | 拷贝完整状态结构（含 map/env 字段） |
+| `BOOL GetCanAttackStatus(CanAttackStatus*)` | 拷贝完整状态结构（含 map/env/canPlace 字段） |
 
 其他程序可通过共享内存 `Local\MCCanAttackStatus_<pid>` (结构见
 `MCCanAttackJni.cpp` 顶部) 读取状态，无需调用 DLL 函数。
 
 ## 测试方法（不需要开真实游戏）
 
-`test/` 下有 5 套假客户端，分别模拟 5 种运行时的类名/成员名结构。
+`test/` 下有 6 套假客户端，分别模拟 6 种运行时的类名/成员名结构
+（mcp189 / vanilla189 / forge189 / forge1122 / vanilla1201 / forge1201）。
 以 forge1201 为例：
 
 ```bat
@@ -97,10 +115,12 @@ cd test\forge1201
 javac -encoding UTF-8 -d out TestMC1201F.java net\minecraft\client\Minecraft.java ^
       net\minecraft\client\player\LocalPlayer.java net\minecraft\world\entity\player\Player.java ^
       net\minecraft\world\entity\LivingEntity.java net\minecraft\world\entity\Entity.java ^
-      net\minecraft\world\phys\HitResult.java net\minecraft\world\phys\EntityHitResult.java
+      net\minecraft\world\phys\HitResult.java net\minecraft\world\phys\EntityHitResult.java ^
+      net\minecraft\world\item\ItemStack.java net\minecraft\world\item\Item.java ^
+      net\minecraft\world\item\BlockItem.java
 java -cp out TestMC1201F        :: 另开终端运行下一条
-injector.exe                    :: 注入后, 在本机 35785 端口收 UDP 0/1 即通过
-                                :: (可用 python 监听: python -c "import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(('127.0.0.1',35785));print(s.recvfrom(64))" 循环执行)
+injector.exe                    :: 注入后, 在本机 35785 端口收 UDP 2 字节即通过
+                                :: (可用 python 监听: python -c "import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(('127.0.0.1',35785));d,a=s.recvfrom(64);print('canAttack=%s canPlace=%s'%(d[0:1],d[1:2]))" 循环执行)
 ```
 
 **注意**：假客户端用 JDK 24 普通启动（单一类加载器），无法暴露
@@ -122,8 +142,8 @@ build.bat
 2. DLL 内工作线程通过 `JNI_GetCreatedJavaVMs` 拿到 JavaVM 并 `AttachCurrentThread`，
    找到游戏类加载器（`Launch.classLoader`，注意字段类型是 `LaunchClassLoader`！），
    用 JNI 反射解析 Minecraft 类/字段/方法 ID（9 套映射依次尝试）。
-3. 每 5ms 计算一次 canAttack，通过 UDP 向本机 35785 端口发送 1 字节
-   (0x31='1'=可以攻击 / 0x30='0'=不可以)，并写入共享内存
+3. 每 5ms 计算一次 canAttack / canPlace，通过 UDP 向本机 35785 端口
+   发送 2 字节 (byte0=canAttack, byte1=canPlace)，并写入共享内存
    `Local\MCCanAttackStatus_<pid>`。
 4. 任何程序监听 35785 端口即可获得实时状态（无需调用 DLL 函数）；
    也可读取共享内存获取完整状态（含 map/env 等诊断字段）。

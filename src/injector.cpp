@@ -1,7 +1,8 @@
 //============================================================================
 //  injector.exe
-//  把 MCCanAttackJni.dll 注入到 Minecraft 1.8.9 (java/javaw) 进程。
-//  DLL 注入后会自行向本机 35785 端口 UDP 上报 0/1 (1=可以攻击), 无需监视。
+//  把 MCCanAttackJni.dll 注入到 Minecraft (java/javaw) 进程。
+//  DLL 注入后会自行向本机 35785 端口 UDP 上报 2 字节
+//  (byte0=canAttack '1'/'0', byte1=canPlace '1'/'0'), 无需监视。
 //
 //  用法:
 //    injector.exe                      自动查找 Minecraft 窗口并注入
@@ -201,6 +202,6 @@ int main(int argc, char** argv)
     // 注入
     printf("[*] 注入 %s ...\n", dllPath);
     if (!InjectDll(pid, dllPath)) return 1;
-    printf("[+] 注入完成。DLL 将向本机 35785 端口 UDP 上报 0/1 (1=可以攻击, 0=不可以)。\n");
+    printf("[+] 注入完成。DLL 将向本机 35785 端口 UDP 上报 2 字节 (byte0=可以攻击 1/0, byte1=手持放置物 1/0)。\n");
     return 0;
 }
