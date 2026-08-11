@@ -15,7 +15,7 @@ BlockItem），通过 UDP 向本机 35785 端口持续上报 2 字节：
 | 标识 | 适用环境 | 命名体系 | 验证方式 |
 |---|---|---|---|
 | `mcp189` | MCP 反混淆客户端 1.8.9 | MCP 名 | 假客户端测试 ✅ |
-| `vanilla189` | 原版启动器 1.8.9 | 混淆名 (ave/A/h/s) | 假客户端测试 ✅ + 官方 jar 反编译核对 |
+| `vanilla189` | **原版启动器 1.8.9** | 混淆名 (ave/A/h/s) | **真机实测 ✅** + 官方 jar 反编译核对 |
 | `forge189` | Forge 1.8.9（类名混淆+成员SRG，少见形态） | 混淆类名 + SRG 成员 | 假客户端测试 ✅ |
 | `forge189mcp` | **Forge 1.8.9 标准运行时** | **MCP 类名 + SRG 成员** | **真机实测 ✅ (PCL+OptiFine)** |
 | `forge1122` | **Forge 1.12.2** | **MCP 类名 + SRG 成员**（RayTraceResult 改名；1.9+ 双持用 getHeldItemMainhand） | **真机实测 ✅** |
