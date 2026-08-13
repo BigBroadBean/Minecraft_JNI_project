@@ -13,16 +13,13 @@
 //      byte1 = 0x31 '1'=手持放置物 / 0x30 '0'=不是/空手
 //  (byte0 与旧版 1 字节协议完全一致, 旧接收端无需改动)
 //
-//  支持 10 套命名体系 (按顺序自动尝试), 其中放置物判定成员为
+//  映射表由 tools/gen_maps.py 从 mappings-extracted (54 个版本) 自动生成,
+//  见 mc_maps_generated.h (kGenMaps[]/kGenMapCount, 133 张: vanilla/forge/mojang)。
+//  三种运行时形态 (由数据自动判定), 按顺序自动尝试, 其中放置物判定成员为
 //  "可选解析" —— 解析失败仅 canPlace 恒为 0, 绝不拖垮 canAttack:
-//    1. mcp189      MCP 反混淆客户端 1.8.9 (MCP 名)
-//    2. vanilla189  原版混淆客户端 1.8.9 (obfuscated 名)
-//    3. forge189    Forge 1.8.9 运行时 (类=混淆名, 成员=SRG 名)
-//    4. forge189mcp Forge 1.8.9 运行时 (类=MCP 名, 成员=SRG 名)
-//    5. forge1122   Forge 1.12.2 运行时 (类=MCP 名, 成员=SRG 名)
-//    6. vanilla1122 原版混淆客户端 1.12.2 (obfuscated 名)
-//    7. vanilla1201 原版/Fabric 1.20.1 运行时 (官方混淆名)
-//    8. forge1201obf/9. forge1201stb/10. forge1201 (Forge/NeoForge 1.20.1 三形态)
+//    S1 (1.8.8~1.13.2)  字段式  typeOfHit/entityHit = 字段 (vanilla=混淆名 / forge=SRG func_)
+//    S2 (1.14~1.16.5)   getter 式 (vanilla=混淆名 / forge=SRG func_)
+//    S3 (1.17+)          getter 式 (vanilla=混淆名 / forge=Mojang类+stable m_/f_ / mojang=官方名)
 //
 //  导出函数:
 //    BOOL GetCanAttackNow(void)       -- 直接返回当前是否能攻击
@@ -146,225 +143,7 @@ struct JniMap {
     const char* itemBlockClass;    // ItemBlock/BlockItem 类 (1.8.9: net/.../ItemBlock/yo; 1.20.1: net/.../BlockItem/cds)
 };
 
-// ---- 1. MCP 反混淆客户端 1.8.9 ----
-static const JniMap kMcpMap = {
-    "mcp189",
-    "net/minecraft/client/Minecraft", "()Lnet/minecraft/client/Minecraft;", "getMinecraft",
-    "thePlayer", "Lnet/minecraft/client/entity/EntityPlayerSP;",
-    "objectMouseOver", "Lnet/minecraft/util/MovingObjectPosition;",
-    "net/minecraft/util/MovingObjectPosition",
-    "typeOfHit", NULL, "Lnet/minecraft/util/MovingObjectPosition$MovingObjectType;",
-    NULL,
-    "entityHit", NULL, "Lnet/minecraft/entity/Entity;",
-    "net/minecraft/util/MovingObjectPosition$MovingObjectType",
-    "ENTITY", NULL, "Lnet/minecraft/util/MovingObjectPosition$MovingObjectType;",
-    "net/minecraft/entity/Entity",
-    "canAttackWithItem", "isEntityAlive", NULL,
-    "net/minecraft/entity/EntityLivingBase",
-    "getHeldItem", "()Lnet/minecraft/item/ItemStack;",
-    "net/minecraft/item/ItemStack", "getItem", "()Lnet/minecraft/item/Item;",
-    "net/minecraft/item/ItemBlock",
-};
-
-// ---- 2. 原版混淆客户端 1.8.9 ----
-static const JniMap kVanilla189Map = {
-    "vanilla189",
-    "ave", "()Lave;", "A",
-    "h", "Lbew;",
-    "s", "Lauh;",
-    "auh",
-    "a", NULL, "Lauh$a;",
-    NULL,
-    "d", NULL, "Lpk;",
-    "auh$a",
-    "c", NULL, "Lauh$a;",
-    "pk",
-    "aD", "ai", NULL,
-    "pr",
-    "bA", "()Lzx;",
-    "zx", "b", "()Lzw;",
-    "yo",
-};
-
-// ---- 3. Forge 1.8.9 (类=混淆名, 成员=SRG 名) ----
-static const JniMap kForge189Map = {
-    "forge189",
-    "ave", "()Lave;", "func_71410_x",
-    "field_71439_g", "Lbew;",
-    "field_71476_x", "Lauh;",
-    "auh",
-    "field_72313_a", NULL, "Lauh$a;",
-    NULL,
-    "field_72308_g", NULL, "Lpk;",
-    "auh$a",
-    "ENTITY", "c", "Lauh$a;",
-    "pk",
-    "func_70075_an", "func_70089_S", NULL,
-    "pr",
-    "func_70694_bm", "()Lzx;",
-    "zx", "func_77973_b", "()Lzw;",
-    "yo",
-};
-
-// ---- 3b. Forge 1.8.9 (FML 运行时反混淆: 类名=MCP 名, 成员=SRG 名) ----
-// (实测验证: net.minecraft.client.Minecraft + func_71410_x)
-static const JniMap kForge189McpMap = {
-    "forge189mcp",
-    "net/minecraft/client/Minecraft", "()Lnet/minecraft/client/Minecraft;", "func_71410_x",
-    "field_71439_g", "Lnet/minecraft/client/entity/EntityPlayerSP;",
-    "field_71476_x", "Lnet/minecraft/util/MovingObjectPosition;",
-    "net/minecraft/util/MovingObjectPosition",
-    "field_72313_a", NULL, "Lnet/minecraft/util/MovingObjectPosition$MovingObjectType;",
-    NULL,
-    "field_72308_g", NULL, "Lnet/minecraft/entity/Entity;",
-    "net/minecraft/util/MovingObjectPosition$MovingObjectType",
-    "ENTITY", "field_72376_c", "Lnet/minecraft/util/MovingObjectPosition$MovingObjectType;",
-    "net/minecraft/entity/Entity",
-    "func_70075_an", "func_70089_S", NULL,
-    "net/minecraft/entity/EntityLivingBase",
-    "func_70694_bm", "()Lnet/minecraft/item/ItemStack;",
-    "net/minecraft/item/ItemStack", "func_77973_b", "()Lnet/minecraft/item/Item;",
-    "net/minecraft/item/ItemBlock",
-};
-
-// ---- 3c. Forge 1.12.2 (类名=MCP 名, 成员=SRG 名; 与 forge189mcp 同形态,
-//       差异: ① MovingObjectPosition 在 1.12 改名为 RayTraceResult!
-//              ② 1.9+ 引入双持, 无参 getHeldItem (func_70694_bm) 被移除,
-//                 改用 getHeldItemMainhand (func_184614_ca)!
-//  (真机实测: mccls:OK + 方法名 func_xxx; 映射来自 deobfuscation_data-1.12.2.lzma) ----
-static const JniMap kForge1122Map = {
-    "forge1122",
-    "net/minecraft/client/Minecraft", "()Lnet/minecraft/client/Minecraft;", "func_71410_x",
-    "field_71439_g", "Lnet/minecraft/client/entity/EntityPlayerSP;",
-    "field_71476_x", "Lnet/minecraft/util/math/RayTraceResult;",
-    "net/minecraft/util/math/RayTraceResult",
-    "field_72313_a", NULL, "Lnet/minecraft/util/math/RayTraceResult$Type;",
-    NULL,
-    "field_72308_g", NULL, "Lnet/minecraft/entity/Entity;",
-    "net/minecraft/util/math/RayTraceResult$Type",
-    "ENTITY", "c", "Lnet/minecraft/util/math/RayTraceResult$Type;",
-    "net/minecraft/entity/Entity",
-    "func_70075_an", "func_70089_S", NULL,
-    "net/minecraft/entity/EntityLivingBase",
-    "func_184614_ca", "()Lnet/minecraft/item/ItemStack;",
-    "net/minecraft/item/ItemStack", "func_77973_b", "()Lnet/minecraft/item/Item;",
-    "net/minecraft/item/ItemBlock",
-};
-
-// ---- 3d. 原版混淆客户端 1.12.2 (obfuscated 名; 类名与 1.8.9 全不同!
-//       1.9+ 双持: 取手持用 co=getHeldItemMainhand, 无参 getHeldItem 已移除)
-//  (混淆名来自 deobfuscation_data-1.12.2.lzma: CL: bib Minecraft / CL: vg Entity
-//   / CL: vp LivingBase / CL: bud EntityPlayerSP / CL: bhc RayTraceResult) ----
-static const JniMap kVanilla1122Map = {
-    "vanilla1122",
-    "bib", "()Lbib;", "z",
-    "h", "Lbud;",
-    "s", "Lbhc;",
-    "bhc",
-    "a", NULL, "Lbhc$a;",
-    NULL,
-    "d", NULL, "Lvg;",
-    "bhc$a",
-    "c", NULL, "Lbhc$a;",
-    "vg",
-    "bd", "aC", NULL,
-    "vp",
-    "co", "()Laip;",
-    "aip", "c", "()Lain;",
-    "ahb",
-};
-
-// ---- 4. 原版/Fabric 1.20.1 (官方混淆名, 经 Mojang 官方映射验证) ----
-static const JniMap kVanilla1201Map = {
-    "vanilla1201",
-    "enn", "()Lenn;", "N",
-    "t", "Lfiy;",
-    "w", "Leeg;",
-    "eeg",
-    NULL, "c", "()Leeg$a;",
-    "eef",
-    NULL, "a", "()Lbfj;",
-    "eeg$a",
-    "c", NULL, "Leeg$a;",
-    "bfj",
-    NULL, "bs", "cn",
-    "bfz",
-    "eO", "()Lcfz;",
-    "cfz", "d", "()Lcfu;",
-    "cds",
-};
-
-// ---- 4b. Forge/NeoForge 1.20.1 (类名=Mojang 官方名, 成员=混淆名) ----
-// (真机实测: ModLauncher 只重映射类名, 成员名保持混淆!
-//  混淆名来自 verify/client-1.20.1-mappings.txt 官方映射文件)
-static const JniMap kForge1201ObfMap = {
-    "forge1201obf",
-    "net/minecraft/client/Minecraft", "()Lnet/minecraft/client/Minecraft;", "N",
-    "t", "Lnet/minecraft/client/player/LocalPlayer;",
-    "w", "Lnet/minecraft/world/phys/HitResult;",
-    "net/minecraft/world/phys/HitResult",
-    NULL, "c", "()Lnet/minecraft/world/phys/HitResult$Type;",
-    "net/minecraft/world/phys/EntityHitResult",
-    NULL, "a", "()Lnet/minecraft/world/entity/Entity;",
-    "net/minecraft/world/phys/HitResult$Type",
-    "c", NULL, "Lnet/minecraft/world/phys/HitResult$Type;",
-    "net/minecraft/world/entity/Entity",
-    NULL, "bs", "cn",
-    "net/minecraft/world/entity/LivingEntity",
-    "eO", "()Lnet/minecraft/world/item/ItemStack;",
-    "net/minecraft/world/item/ItemStack", "d", "()Lnet/minecraft/world/item/Item;",
-    "net/minecraft/world/item/BlockItem",
-};
-
-// ---- 4c. Forge/NeoForge 1.20.1 (类名=Mojang 官方名, 成员=MCP stable 名) ----
-// (真机实测: 方法名是 m_91087_ 格式! 来自 mcp_config 的 stable 映射:
-//  getInstance=m_91087_ player=f_91074_ hitResult=f_91077_ getType=m_6662_
-//  getEntity=m_82443_ isAlive=m_6084_ isAttackable=m_6097_ ENTITY=ENTITY)
-static const JniMap kForge1201StableMap = {
-    "forge1201stb",
-    "net/minecraft/client/Minecraft", "()Lnet/minecraft/client/Minecraft;", "m_91087_",
-    "f_91074_", "Lnet/minecraft/client/player/LocalPlayer;",
-    "f_91077_", "Lnet/minecraft/world/phys/HitResult;",
-    "net/minecraft/world/phys/HitResult",
-    NULL, "m_6662_", "()Lnet/minecraft/world/phys/HitResult$Type;",
-    "net/minecraft/world/phys/EntityHitResult",
-    NULL, "m_82443_", "()Lnet/minecraft/world/entity/Entity;",
-    "net/minecraft/world/phys/HitResult$Type",
-    "ENTITY", NULL, "Lnet/minecraft/world/phys/HitResult$Type;",
-    "net/minecraft/world/entity/Entity",
-    NULL, "m_6084_", "m_6097_",
-    "net/minecraft/world/entity/LivingEntity",
-    "m_21205_", "()Lnet/minecraft/world/item/ItemStack;",
-    "net/minecraft/world/item/ItemStack", "m_41720_", "()Lnet/minecraft/world/item/Item;",
-    "net/minecraft/world/item/BlockItem",
-};
-
-// ---- 5. Forge/NeoForge 1.20.1 (Mojang 官方名) ----
-static const JniMap kOfficial1201Map = {
-    "forge1201",
-    "net/minecraft/client/Minecraft", "()Lnet/minecraft/client/Minecraft;", "getInstance",
-    "player", "Lnet/minecraft/client/player/LocalPlayer;",
-    "hitResult", "Lnet/minecraft/world/phys/HitResult;",
-    "net/minecraft/world/phys/HitResult",
-    NULL, "getType", "()Lnet/minecraft/world/phys/HitResult$Type;",
-    "net/minecraft/world/phys/EntityHitResult",
-    NULL, "getEntity", "()Lnet/minecraft/world/entity/Entity;",
-    "net/minecraft/world/phys/HitResult$Type",
-    "ENTITY", NULL, "Lnet/minecraft/world/phys/HitResult$Type;",
-    "net/minecraft/world/entity/Entity",
-    NULL, "isAlive", "isAttackable",
-    "net/minecraft/world/entity/LivingEntity",
-    "getMainHandItem", "()Lnet/minecraft/world/item/ItemStack;",
-    "net/minecraft/world/item/ItemStack", "getItem", "()Lnet/minecraft/world/item/Item;",
-    "net/minecraft/world/item/BlockItem",
-};
-
-static const JniMap* kAllMaps[] = {
-    &kMcpMap, &kVanilla189Map, &kForge189Map, &kForge189McpMap, &kForge1122Map,
-    &kVanilla1122Map, &kVanilla1201Map, &kForge1201ObfMap, &kForge1201StableMap,
-    &kOfficial1201Map,
-};
-static const int kMapCount = (int)(sizeof(kAllMaps) / sizeof(kAllMaps[0]));
+#include "mc_maps_generated.h"
 
 //--------------------------------------------------------------------------
 // 类加载辅助: 解决 Forge/launchwrapper 环境下的"双份类副本"问题。
@@ -576,10 +355,10 @@ static jobject FindThreadClassLoader(JNIEnv* env, jclass clsCls, jmethodID forNa
             break;
         }
         // 后备: 能加载其他候选 (如 1.8.9 混淆名 ave)
-        for (int i = 0; i < kMapCount && !found2; ++i) {
-            if (strcmp(kAllMaps[i]->mcClass, "net/minecraft/client/Minecraft") == 0)
+        for (int i = 0; i < kGenMapCount && !found2; ++i) {
+            if (strcmp(kGenMaps[i].mcClass, "net/minecraft/client/Minecraft") == 0)
                 continue; // 已测过
-            jclass probe = LoadClass(env, kAllMaps[i]->mcClass, loader, clsCls, forName);
+            jclass probe = LoadClass(env, kGenMaps[i].mcClass, loader, clsCls, forName);
             if (probe) {
                 env->DeleteLocalRef(probe);
                 found2 = loader;
@@ -611,8 +390,8 @@ static jobject FindGameClassLoader(JNIEnv* env, jclass clsCls, jmethodID forName
     jobject loader = FindLaunchClassLoader(env, clsCls, forName);
     if (loader) {
         bool canLoad = false;
-        for (int i = 0; i < kMapCount && !canLoad; ++i) {
-            jclass probe = LoadClass(env, kAllMaps[i]->mcClass, loader, clsCls, forName);
+        for (int i = 0; i < kGenMapCount && !canLoad; ++i) {
+            jclass probe = LoadClass(env, kGenMaps[i].mcClass, loader, clsCls, forName);
             if (probe) {
                 env->DeleteLocalRef(probe);
                 canLoad = true;
@@ -651,6 +430,7 @@ static void DetectEnv(JNIEnv* env, jobject loader, jclass clsCls, jmethodID forN
     static const Mark marks[] = {
         { "net/minecraftforge/fml/common/FMLCommonHandler",  "forge" },
         { "net/minecraftforge/fml/loading/FMLLoader",        "forge" },
+        { "net/neoforged/fml/loading/FMLLoader",             "neoforge" },
         { "optifine/OptiFineClassTransformer",               "optifine" },
         { "net/optifine/Config",                             "optifine" },
         { "net/fabricmc/loader/FabricLoader",                "fabric" },
@@ -1167,6 +947,130 @@ static jclass FindRealMinecraft(JNIEnv* env, JavaVM* vm,
 }
 
 //--------------------------------------------------------------------------
+// 版本指纹探测: 用每版 vanilla 表的混淆 mcClass 快速定位版本 (原版环境)。
+// Forge/FML/ModLauncher 运行时无混淆类名, 探测不到 -> 返回 0, 回退到全量尝试。
+// 验证 getMinecraft() 返回非 null 才采纳, 排除"双份类副本"(classpath 残留)。
+//--------------------------------------------------------------------------
+static int DetectVersionHint(JNIEnv* env, jobject loader, jclass clsCls, jmethodID forName)
+{
+    for (int i = 0; i < kGenMapCount; ++i) {
+        if (strncmp(kGenMaps[i].name, "vanilla", 7) != 0) continue;
+        jclass c = LoadClass(env, kGenMaps[i].mcClass, loader, clsCls, forName);
+        if (!c) { env->ExceptionClear(); continue; }
+        jmethodID gm = env->GetStaticMethodID(c, kGenMaps[i].getMinecraft, kGenMaps[i].mcSig);
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        jobject inst = gm ? env->CallStaticObjectMethod(c, gm) : NULL;
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (inst) {
+            env->DeleteLocalRef(inst);
+            env->DeleteLocalRef(c);
+            return i;  // 命中: 返回该版 vanilla 表的索引
+        }
+        env->DeleteLocalRef(c);
+    }
+    return 0;  // 未命中 (Forge 或游戏类尚未加载)
+}
+
+//--------------------------------------------------------------------------
+// 版本检测 (JVM classpath): 从 System.getProperty 读 classpath / library.path,
+// 提取 Minecraft 版本号。不读窗口标题 (标题栏可被资源包/语言改写, 不可靠)。
+// 游戏 jar 路径形如:
+//   ...\versions\1.21.11\1.21.11.jar           (原版)
+//   ...\versions\1.16.5-Forge_36.2.34\...      (Forge)
+//   ...\versions\1.21.11-Fabric 0.18.4\...     (Fabric)
+//--------------------------------------------------------------------------
+static int ExtractMcVersion(const char* text, char* out, size_t cap)
+{
+    out[0] = 0;
+    if (!text) return 0;
+    const char* start = NULL;
+    // 优先: "versions" 目录后的版本号 (最可靠, 各启动器通用)
+    const char* p = text;
+    while ((p = strstr(p, "versions")) != NULL) {
+        const char* s = p + 8;
+        while (*s == '\\' || *s == '/' || *s == ' ' || *s == '"') s++;
+        if (s[0] == '1' && s[1] == '.') { start = s; break; }
+        p += 8;
+    }
+    // 回退: 路径组件开头就是 "1." 的版本号
+    if (!start) {
+        p = text;
+        while ((p = strstr(p, "1.")) != NULL) {
+            const char* q = p + 2;
+            if (*q >= '0' && *q <= '9' &&
+                (p == text || p[-1] == ';' || p[-1] == '\\' || p[-1] == '/' ||
+                 p[-1] == ' ' || p[-1] == '=' || p[-1] == ':')) {
+                start = p;
+                break;
+            }
+            p = q;
+        }
+    }
+    if (!start) return 0;
+    size_t n = 0;
+    const char* q = start;
+    while (*q && ((*q >= '0' && *q <= '9') || *q == '.') && n < cap - 1) {
+        out[n++] = *q++;
+    }
+    while (n > 0 && out[n - 1] == '.') out[--n] = 0;  // 去尾点
+    out[n] = 0;
+    return n > 0;
+}
+
+static void GetGameVersion(JNIEnv* env, char* out, size_t cap)
+{
+    out[0] = 0;
+    if (!env) return;
+    jclass sysCls = env->FindClass("java/lang/System");
+    if (!sysCls) { env->ExceptionClear(); return; }
+    jmethodID getProp = env->GetStaticMethodID(sysCls, "getProperty",
+                                               "(Ljava/lang/String;)Ljava/lang/String;");
+    if (!getProp) { env->ExceptionClear(); return; }
+    const char* props[] = { "java.class.path", "java.library.path" };
+    for (int i = 0; i < 2 && out[0] == 0; ++i) {
+        jstring key = env->NewStringUTF(props[i]);
+        if (!key) { env->ExceptionClear(); continue; }
+        jstring val = (jstring)env->CallStaticObjectMethod(sysCls, getProp, key);
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(key);
+        if (!val) continue;
+        const char* utf = env->GetStringUTFChars(val, NULL);
+        if (utf) {
+            ExtractMcVersion(utf, out, cap);
+            env->ReleaseStringUTFChars(val, utf);
+        }
+        env->DeleteLocalRef(val);
+    }
+}
+
+// 版本串 "1.21.11" -> 映射表起点索引 (名字末尾完整数字段 == "12111" 的第一张表);
+// -1 = 未找到。必须匹配"末尾完整数字段", 否则 "121"(1.21) 会误匹配 "1121"(1.12.1)。
+static int FindVersionMapIndex(const char* version)
+{
+    char tag[32];
+    size_t n = 0;
+    for (const char* p = version; *p && n < sizeof(tag) - 1; ++p) {
+        if (*p >= '0' && *p <= '9') tag[n++] = *p;
+    }
+    tag[n] = 0;
+    if (n == 0) return -1;
+    for (int i = 0; i < kGenMapCount; ++i) {
+        const char* name = kGenMaps[i].name;
+        size_t nameLen = strlen(name);
+        // 名字末尾的连续数字段长度必须 == 版本 tag 长度 (精确匹配, 防后缀撞名)
+        size_t digits = 0;
+        while (digits < nameLen && name[nameLen - 1 - digits] >= '0' &&
+               name[nameLen - 1 - digits] <= '9') {
+            digits++;
+        }
+        if (digits == n && strncmp(name + nameLen - n, tag, n) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+//--------------------------------------------------------------------------
 // 工作线程: 等待 JVM -> 解析映射 -> 循环更新状态
 //--------------------------------------------------------------------------
 static DWORD WINAPI JniWorker(LPVOID)
@@ -1199,6 +1103,7 @@ static DWORD WINAPI JniWorker(LPVOID)
     }
 
     // 等待 jvm.dll 被加载 (游戏进程启动后很快就有), 无限等待直到 g_stop
+    CopyName(g_status->errMsg, sizeof(g_status->errMsg), "W0:wait-jvm");
     HMODULE jvm = NULL;
     while (!g_stop) {
         jvm = GetModuleHandleA("jvm.dll");
@@ -1206,17 +1111,26 @@ static DWORD WINAPI JniWorker(LPVOID)
         Sleep(200);
     }
     if (!jvm || g_stop) return 0; // 仅进程退出时才会走到这里
+    CopyName(g_status->errMsg, sizeof(g_status->errMsg), "W1:jvm-ok");
 
     typedef jint (JNICALL* GetCreatedVMs_t)(JavaVM**, jsize, jsize*);
     GetCreatedVMs_t getVMs = (GetCreatedVMs_t)GetProcAddress(jvm, "JNI_GetCreatedJavaVMs");
-    if (!getVMs) return 0;
+    if (!getVMs) { CopyName(g_status->errMsg, sizeof(g_status->errMsg), "W2:no-getVMs"); return 0; }
 
     JavaVM* vm = NULL;
     jsize   n  = 0;
-    if (getVMs(&vm, 1, &n) != JNI_OK || n < 1 || !vm) return 0;
+    if (getVMs(&vm, 1, &n) != JNI_OK || n < 1 || !vm) {
+        CopyName(g_status->errMsg, sizeof(g_status->errMsg), "W3:getVMs-fail");
+        return 0;
+    }
+    CopyName(g_status->errMsg, sizeof(g_status->errMsg), "W4:vm-ok");
 
     JNIEnv* env = NULL;
-    if (vm->AttachCurrentThread((void**)&env, NULL) != JNI_OK || !env) return 0;
+    if (vm->AttachCurrentThread((void**)&env, NULL) != JNI_OK || !env) {
+        CopyName(g_status->errMsg, sizeof(g_status->errMsg), "W5:attach-fail");
+        return 0;
+    }
+    CopyName(g_status->errMsg, sizeof(g_status->errMsg), "W6:attach-ok");
 
     // 一次性获取 java/lang/Class.forName 的 ID, 以及游戏类加载器
     jclass  clsCls  = env->FindClass("java/lang/Class");
@@ -1287,19 +1201,34 @@ static DWORD WINAPI JniWorker(LPVOID)
     int      mapIdx    = 0;
     int      nullMcStreak = 0;
 
+    // 版本检测: 从 JVM classpath 提取版本号, 定位到对应映射表起点
+    // (Forge/Fabric 关键: 运行时无混淆类名, 不能靠 mcClass 指纹)
+    char gameVer[32];
+    GetGameVersion(env, gameVer, sizeof(gameVer));
+    int verHint = FindVersionMapIndex(gameVer);
+    if (g_status && gameVer[0]) {
+        // 把检测到的版本写进 envName 尾部, 便于诊断
+        size_t el = strlen(g_status->envName);
+        if (el + 1 + strlen(gameVer) < sizeof(g_status->envName)) {
+            if (el) g_status->envName[el++] = '+';
+            strcpy(g_status->envName + el, gameVer);
+        }
+    }
+
     while (!g_stop) {
         if (!res.ok) {
-            // 尚未解析成功: 依次尝试 10 套映射, 每 500ms 重试一轮
-            // (游戏类可能还在加载)
+            // 尚未解析成功: 每 500ms 重试一轮 (游戏类可能还在加载)。
+            // 每轮先用版本指纹定位 (原版秒定位; Forge 探测不到 -> 从 0 全量尝试)。
             jobject loader = useGameLoader ? gameLoader : sysLoader;
             g_status->failLog[0] = 0; // 每轮清空失败汇总
+            mapIdx = (verHint >= 0) ? verHint : DetectVersionHint(env, loader, clsCls, forName);
             bool ok = false;
-            while (mapIdx < kMapCount && !ok) {
+            while (mapIdx < kGenMapCount && !ok) {
                 CopyName(g_status->errMsg, sizeof(g_status->errMsg),
-                         kAllMaps[mapIdx]->name);
+                         kGenMaps[mapIdx].name);
                 // 尝试当前加载器
                 Resolved tryRes;
-                bool tryOk = ResolveWith(env, *kAllMaps[mapIdx], tryRes, loader, clsCls, forName);
+                bool tryOk = ResolveWith(env, kGenMaps[mapIdx], tryRes, loader, clsCls, forName);
                 if (tryOk) {
                     // 终极验证: getMinecraft() 必须返回真实例, 排除双份类副本
                     jobject inst = env->CallStaticObjectMethod(tryRes.mcClass, tryRes.getMinecraft);
@@ -1309,15 +1238,15 @@ static DWORD WINAPI JniWorker(LPVOID)
                     if (hasInst) { res = tryRes; ok = true; }
                     else {
                         CopyName(g_status->errMsg, sizeof(g_status->errMsg),
-                                 kAllMaps[mapIdx]->name);
-                        NoteErr(kAllMaps[mapIdx]->name, "getMinecraft()=null(副本)");
+                                 kGenMaps[mapIdx].name);
+                        NoteErr(kGenMaps[mapIdx].name, "getMinecraft()=null(副本)");
                     }
                 }
                 // 当前加载器失败/副本时, 同轮换另一个加载器再试 (TCL 与 app loader 都覆盖)
                 if (!ok && gameLoader && sysLoader && gameLoader != sysLoader) {
                     jobject loader2 = (loader == gameLoader) ? sysLoader : gameLoader;
                     Resolved tryRes2;
-                    bool tryOk2 = ResolveWith(env, *kAllMaps[mapIdx], tryRes2, loader2, clsCls, forName);
+                    bool tryOk2 = ResolveWith(env, kGenMaps[mapIdx], tryRes2, loader2, clsCls, forName);
                     if (tryOk2) {
                         jobject inst2 = env->CallStaticObjectMethod(tryRes2.mcClass, tryRes2.getMinecraft);
                         bool hasInst2 = (inst2 != NULL);
@@ -1337,7 +1266,7 @@ static DWORD WINAPI JniWorker(LPVOID)
                 CopyName(g_status->mappingName, sizeof(g_status->mappingName), res.name);
                 // 终极修正: JVMTI 找"真 Minecraft 类" (getter 返回非 null),
                 // 用它的类加载器重新解析, 彻底解决双份类副本问题
-                const JniMap& mOk = *kAllMaps[mapIdx]; // mapIdx 此时指向成功的那套
+                const JniMap& mOk = kGenMaps[mapIdx]; // mapIdx 此时指向成功的那套
 #ifndef NO_REAL_FIX
                 // 终极修正 A: findLoadedClass 拿游戏已加载的真类
                 jclass realMc = FindLoadedGameClass(env, launchLoader, mOk.mcClass,

@@ -9,32 +9,31 @@
 通过向运行中的 Minecraft (java/javaw 进程) 注入 DLL，每 5ms 读取
 `Minecraft` 单例的 `thePlayer` / `objectMouseOver`，判断玩家当前
 **是否瞄准到了一个可以攻击的生物**（`canAttack`），并检测**手持物品
-是否为放置物**（`canPlace`，1.8.9/1.12.2 的 ItemBlock / 1.20.1 的
+是否为放置物**（`canPlace`，1.8~1.16.5 的 ItemBlock / 1.14+ 的
 BlockItem），通过 UDP 向本机 35785 端口持续上报 2 字节：
 `[byte0=canAttack '1'/'0'][byte1=canPlace '1'/'0']`，同时把结果写入
 共享内存供外部程序读取。
 
 ## 支持的版本 / 客户端
 
-| 标识 | 适用环境 | 命名体系 | 验证方式 |
+映射表由 `tools/gen_maps.py` 从 `mappings-extracted`（1.8.8~1.21.11，
+6 命名空间）自动生成 **171 张表**，覆盖 **54 个版本 × 4 种命名空间**，
+无需任何配置。DLL 先按 **classpath 里的版本号**定位到对应版本，再按顺序
+尝试该版本的 vanilla → forge → mojang → intermediary 表；注入后
+`map=` 字段显示命中的表。
+
+| 运行时形态 | 版本 | 命名空间 | 验证 |
 |---|---|---|---|
-| `mcp189` | MCP 反混淆客户端 1.8.9 | MCP 名 | 假客户端测试 ✅ |
-| `vanilla189` | **原版启动器 1.8.9** | 混淆名 (ave/A/h/s) | **真机实测 ✅** + 官方 jar 反编译核对 |
-| `forge189` | Forge 1.8.9（类名混淆+成员SRG，少见形态） | 混淆类名 + SRG 成员 | 假客户端测试 ✅ |
-| `forge189mcp` | **Forge 1.8.9 标准运行时** | **MCP 类名 + SRG 成员** | **真机实测 ✅ (PCL+OptiFine)** |
-| `forge1122` | **Forge 1.12.2** | **MCP 类名 + SRG 成员**（RayTraceResult 改名；1.9+ 双持用 getHeldItemMainhand） | **真机实测 ✅** |
-| `vanilla1122` | **原版启动器 1.12.2** | 混淆名 (bib/z/h/s) | **真机实测 ✅** + deobfuscation lzma 核对 |
-| `vanilla1201` | **原版 / Fabric 1.20.1** | 官方混淆名 | **真机实测 ✅** + Mojang 官方映射核对 |
-| `forge1201obf` | Forge/NeoForge 1.20.1（理论形态） | Mojang 类名 + 混淆成员 | 假客户端测试 ✅ |
-| `forge1201stb` | **Forge/NeoForge 1.20.1 标准运行时** | **Mojang 类名 + MCP stable 成员** | **真机实测 ✅** |
-| `forge1201` | Forge/NeoForge 1.20.1（其他形态） | Mojang 官方名 | 假客户端测试 ✅ + Mojang 官方映射核对 |
+| **S1 字段式**（typeOfHit/entityHit 为字段） | 1.8.8 ~ 1.13.2 | vanilla=混淆名 / forge=MCP 类名+SRG `func_/field_` | ✅ 1.8.9、1.12.2（真机+diff） |
+| **S2 getter 式**（getType/getEntity） | 1.14 ~ 1.16.5 | vanilla=混淆名 / forge=MCP+SRG / intermediary=`class_/method_/field_`(Fabric) | ✅ 原版 1.14、Forge 1.16.5、Fabric 1.16.5 真机 |
+| **S3 getter 式** | 1.17 ~ 1.21.11 | vanilla=混淆名 / forge=Mojang+stable `m_/f_`(1.17~1.20.1) / mojang=全 Mojang(NeoForge 1.20.2+) / intermediary(Fabric) | ✅ Forge 1.20.1、NeoForge 1.20.4/1.21/1.21.11、Fabric 1.21.11 真机 |
 
-DLL 按上表顺序自动尝试 10 套命名，**无需任何配置**。注入后 `map=` 字段显示命中的体系。
-
-> **重要发现（真机实测）**：
-> - **Forge 1.8.9**：FML 运行时反混淆 = **类名转 MCP 名**（`net.minecraft.client.Minecraft`）+ **成员转 SRG 名**（`func_71410_x`）
-> - **Forge 1.20.1**：ModLauncher = **类名用 Mojang 官方名**（`net.minecraft.client.Minecraft`）+ **成员用 MCP stable 名**（`m_91087_` 格式）
-> 两个版本都既不是纯混淆也不是纯官方名——这就是本项目踩坑最多的部分（详见《技术文档》复盘）。
+> **真机实测命名规律（重要，详见《技术文档》第六章）**：
+> - **原版启动器**：永远混淆名（1.14=`cvi`、1.20.1=`enn`）
+> - **Forge 1.8~1.16.5**：类名转 **MCP 名** + 成员转 **SRG 名**（`func_71410_x`）
+> - **Forge 1.17~1.20.1**：类名转 **Mojang 名** + 成员转 **MCP stable 名**（`m_91087_`）
+> - **NeoForge 1.20.2+**：类名+成员**全 Mojang 官方名**（`getInstance`）
+> - **Fabric（1.14+）**：全 **Intermediary 名**（`net/minecraft/class_310` + `method_1551`）
 
 ## 判定逻辑
 
@@ -52,7 +51,7 @@ canPlace = (player.getHeldItem() / getMainHandItem() != null)   // 手持有物�
 ```
 
 `canPlace` 只依赖玩家手持物品，与准星无关（未瞄准时仍正常上报）。
-放置物成员在 10 套映射中为**可选解析**——某环境下解析失败仅 `canPlace`
+放置物成员在所有映射中为**可选解析**——某环境下解析失败仅 `canPlace`
 恒为 0，**不影响 canAttack**。
 
 ## 文件结构
@@ -64,8 +63,12 @@ MCCombatStatus-JNI/
 ├── injector.exe              注入器 (注入即退出, 无显示)
 ├── include/                  JNI/JVMTI 头文件
 ├── src/
-│   ├── MCCombatStatusJni.cpp 注入 DLL 源码 (10 套映射表 + 环境探测 + UDP 上报)
+│   ├── MCCombatStatusJni.cpp 注入 DLL 源码 (映射表自动生成 + 环境探测 + UDP 上报)
+│   ├── mc_maps_generated.h   自动生成的映射表 (54 版本 171 张, 勿手改)
 │   └── injector.cpp          注入器源码
+├── tools/
+│   ├── gen_maps.py           映射表生成器 (从 mappings-extracted 生成 + 查询 CLI)
+│   └── smoke_test.py         端到端冒烟测试 (假客户端+注入+UDP 采样)
 ├── test/                     假客户端测试 (7 套: 各命名体系一套)
 ├── verify/                   验证工具 (jmap/jcmd 记录等)
 ├── JNI零基础教学.md           零基础入门教程
@@ -143,9 +146,14 @@ injector.exe                    :: 注入后, 在本机 35785 端口收 UDP 2 �
                                 :: (可用 python 监听: python -c "import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(('127.0.0.1',35785));d,a=s.recvfrom(64);print('canAttack=%s canPlace=%s'%(d[0:1],d[1:2]))" 循环执行)
 ```
 
-**注意**：假客户端用 JDK 24 普通启动（单一类加载器），无法暴露
+**注意**：假客户端用 JDK 普通启动（单一类加载器），无法暴露
 Forge/launchwrapper 的多加载器问题——**真机验证不可替代**（本项目的
 核心 bug 全部是真机才暴露的）。
+
+**自动化冒烟测试**（推荐替代手工测试）：`tools/smoke_test.py` 一键完成
+"启动假客户端 → 自动找窗口注入 → 读共享内存 + UDP 采样"，按阶段校验
+`canAttack/canPlace` 组合是否符合预期。注意它依赖假客户端的
+`Minecraft` 窗口标题，且 JDK 版本需与假客户端匹配。
 
 ## 重新编译
 
@@ -155,13 +163,46 @@ build.bat
 
 （需要 MinGW-w64 g++，路径可在 build.bat 中修改；JNI 头文件已内置在 include/）
 
+## 映射表自动生成 (54 版本)
+
+`src/mc_maps_generated.h` 由 `tools/gen_maps.py` 从
+`D:\VibeCoding\mappings-extracted`（1.8.8~1.21.11，6 命名空间）自动生成，
+**不要手改**。生成 171 张表，覆盖四种运行时形态：
+
+| 形态 | 版本 | vanilla (原版) | forge (FML/NeoForge) | mojang | intermediary (Fabric) |
+|---|---|---|---|---|---|
+| S1 字段式 | 1.8.8~1.13.2 | 混淆名 | MCP 类名 + SRG `func_/field_` | — | — |
+| S2 getter 式 | 1.14~1.16.5 | 混淆名 | MCP 类名 + SRG `func_/field_` | — | class_/method_/field_ |
+| S3 getter 式 | 1.17+ | 混淆名 | Mojang 类名 + stable `m_/f_` | 官方名 | class_/method_/field_ |
+
+关键结论（已用数据验证）：SRG 名 `func_71410_x`(getMinecraft) 在 1.8.8~1.16.5
+全程不变；stable 名 `m_91087_`(getInstance) 在 1.17~1.21.11 全程不变——
+所以新增版本基本"查表即可"，无需再手写。
+**注意**：Intermediary 名（Fabric）**并非**完全跨版本稳定（如 `ItemStack.getItem`
+在 1.14 是 `method_7949`、1.21.11 是 `method_7909`），因此 DLL 靠窗口标题里的
+版本号（如 `Minecraft* 1.21.11`）来定位到正确版本的表。
+
+```bash
+# 重新生成 (改动了生成器或数据后)
+python tools\gen_maps.py --emit
+
+# 查一个名字跨 6 命名空间叫什么 (取代 grep lzma/mcp_config)
+python tools\gen_maps.py --query 1.20.1 getInstance
+python tools\gen_maps.py --query 1.12.2 func_184614_ca
+
+# 打印某版本解析结果 (人工核对)
+python tools\gen_maps.py --report --versions 1.16.5 1.21.11
+```
+
+> 数据目录路径 `BASE` 在 `gen_maps.py` 顶部，换机器时改这一处即可。
+
 ## 原理说明
 
 1. `injector.exe` 找到 java/javaw 进程后，用
    `CreateRemoteThread + LoadLibraryA` 注入 `MCCombatStatusJni.dll`。
 2. DLL 内工作线程通过 `JNI_GetCreatedJavaVMs` 拿到 JavaVM 并 `AttachCurrentThread`，
    找到游戏类加载器（`Launch.classLoader`，注意字段类型是 `LaunchClassLoader`！），
-   用 JNI 反射解析 Minecraft 类/字段/方法 ID（10 套映射依次尝试）。
+   用 JNI 反射解析 Minecraft 类/字段/方法 ID（按 classpath 版本号定位后，依次尝试该版本的映射表）。
 3. 每 5ms 计算一次 canAttack / canPlace，通过 UDP 向本机 35785 端口
    发送 2 字节 (byte0=canAttack, byte1=canPlace)，并写入共享内存
    `Local\MCCombatStatus_<pid>`。
