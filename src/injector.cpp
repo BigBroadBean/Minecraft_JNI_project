@@ -237,7 +237,6 @@ static bool ManualMap(HANDLE proc, const BYTE* img, size_t imgSize)
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
     IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(img + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
-            nt->FileHeader.NumberOfSections, nt->OptionalHeader.SizeOfImage);
 
     DWORD sizeOfImage = nt->OptionalHeader.SizeOfImage;
     DWORD sizeOfHeaders = nt->OptionalHeader.SizeOfHeaders;
