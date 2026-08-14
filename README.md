@@ -26,7 +26,11 @@ BlockItem），通过 UDP 向本机 35785 端口持续上报 2 字节：
 |---|---|---|---|
 | **S1 字段式**（typeOfHit/entityHit 为字段） | 1.8.8 ~ 1.13.2 | vanilla=混淆名 / forge=MCP 类名+SRG `func_/field_` | ✅ 1.8.9、1.12.2（真机+diff） |
 | **S2 getter 式**（getType/getEntity） | 1.14 ~ 1.16.5 | vanilla=混淆名 / forge=MCP+SRG / intermediary=`class_/method_/field_`(Fabric) | ✅ 原版 1.14、Forge 1.16.5、Fabric 1.16.5 真机 |
-| **S3 getter 式** | 1.17 ~ 1.21.11 | vanilla=混淆名 / forge=Mojang+stable `m_/f_`(1.17~1.20.1) / mojang=全 Mojang(NeoForge 1.20.2+) / intermediary(Fabric) | ✅ Forge 1.20.1、NeoForge 1.20.4/1.21/1.21.11、Fabric 1.21.11 真机 |
+| **S3 getter 式** | 1.17 ~ 1.21.11 | vanilla=混淆名 / forge=Mojang+stable `m_/f_`(1.17~1.20.1) / mojang=全 Mojang(NeoForge 1.20.2+) / intermediary(Fabric) | ✅ Forge 1.20.1、NeoForge 1.20.4/1.21/1.21.8/1.21.11、Fabric 1.21.11 真机 |
+
+> **环境感知起始表**（V65.1）：按探测到的 mod 加载器直接定位对应命名空间表
+> （NeoForge→mojang / Forge→forge / Fabric→intermediary），首次解析从
+> 全表轮询的 10~30 秒缩短到 **<1 秒**；失败仍回退全表。
 
 > **真机实测命名规律（重要，详见《技术文档》第六章）**：
 > - **原版启动器**：永远混淆名（1.14=`cvi`、1.20.1=`enn`）
