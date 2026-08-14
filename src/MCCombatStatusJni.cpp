@@ -664,6 +664,117 @@ static void CopyName(char* dst, size_t cap, const char* src)
 }
 
 //--------------------------------------------------------------------------
+// V70: APC 加载器 —— 注入器把映像映射进目标后, 用 NtQueueApcThread 在
+// 目标线程上执行本函数 (不创建新线程)。执行前提: 映像已映射、IAT 可能
+// 未修复、CRT 未初始化、DllMain 未运行。因此本函数必须自包含:
+//   * 不调用任何 IAT 导入函数 (先手工遍历导出表解析 kernel32 再修 IAT)
+//   * 不使用任何需要构造的静态对象
+//   * 参数: rcx=映像基址 (NtQueueApcThread 的 SystemArgument1)
+//--------------------------------------------------------------------------
+static void* GetPeb(void);   // 前向声明 (定义在反检测段)
+static void* LdrGetProcAddr(HMODULE mod, const char* name)
+{
+    BYTE* b = (BYTE*)mod;
+    if (!b) return NULL;
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)b;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return NULL;
+    IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(b + dos->e_lfanew);
+    DWORD rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    if (!rva) return NULL;
+    IMAGE_EXPORT_DIRECTORY* ed = (IMAGE_EXPORT_DIRECTORY*)(b + rva);
+    DWORD* names = (DWORD*)(b + ed->AddressOfNames);
+    WORD*  ords  = (WORD*)(b + ed->AddressOfNameOrdinals);
+    DWORD* funcs = (DWORD*)(b + ed->AddressOfFunctions);
+    for (DWORD i = 0; i < ed->NumberOfNames; i++) {
+        const char* n = (const char*)(b + names[i]);
+        const char* p = name;
+        while (*p && *n && *p == *n) { p++; n++; }
+        if (*p == 0 && *n == 0)
+            return b + funcs[ords[i]];
+    }
+    return NULL;
+}
+
+// PEB InLoadOrder 遍历找模块基址 (按 BaseDllName 比较; 大小写不敏感)
+static void* PebFindModule(const char* targetLower, int targetLen)
+{
+    unsigned char* peb = (unsigned char*)GetPeb();
+    if (!peb) return NULL;
+    void** ldr = (void**)(peb + 0x18);
+    if (!ldr || !*ldr) return NULL;
+    unsigned char* l = (unsigned char*)*ldr;
+    unsigned char* head = l + 0x10;                    // InLoadOrderModuleList 头
+    for (unsigned char* cur = *(unsigned char**)head; cur && cur != head; cur = *(unsigned char**)cur) {
+        void* dllBase = *(void**)(cur + 0x30);
+        unsigned short len = *(unsigned short*)(cur + 0x58);   // BaseDllName.Length
+        wchar_t* nm = *(wchar_t**)(cur + 0x60);                // BaseDllName.Buffer
+        if (!nm || len < 4) continue;
+        int n = len / 2;
+        if (n != targetLen) continue;
+        bool match = true;
+        for (int i = 0; i < n; i++) {
+            char c = (char)nm[i];
+            if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+            if (c != targetLower[i]) { match = false; break; }
+        }
+        if (match) return dllBase;
+    }
+    return NULL;
+}
+
+extern "C" void ApcLoader(void* base, void*, void*)
+{
+    if (!base) return;
+    // 1. 手工解析 kernel32 (PEB 遍历 + 导出表遍历, 全程不碰 IAT)
+    static const char k32Name[] = { 'k','e','r','n','e','l','3','2','.','d','l','l' };
+    HMODULE k32 = (HMODULE)PebFindModule(k32Name, sizeof(k32Name));
+    if (!k32) return;
+    void* pGetProc = LdrGetProcAddr(k32, "GetProcAddress");
+    void* pLoadLib = LdrGetProcAddr(k32, "LoadLibraryA");
+    if (!pGetProc || !pLoadLib) return;
+    typedef void* (WINAPI* GPA_t)(HMODULE, const char*);
+    typedef HMODULE (WINAPI* LL_t)(const char*);
+    GPA_t GPA = (GPA_t)pGetProc;
+    LL_t  LL  = (LL_t)pLoadLib;
+
+    // 2. 修复自身 IAT (GetModuleHandle 不可用, 用 LoadLibraryA: 已加载模块只加引用计数)
+    BYTE* b = (BYTE*)base;
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)b;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+    IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(b + dos->e_lfanew);
+    IMAGE_DATA_DIRECTORY& imp = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    DWORD off = 0;
+    while (off + sizeof(IMAGE_IMPORT_DESCRIPTOR) <= imp.Size) {
+        IMAGE_IMPORT_DESCRIPTOR* desc = (IMAGE_IMPORT_DESCRIPTOR*)(b + imp.VirtualAddress + off);
+        if (!desc->Name && !desc->FirstThunk) break;
+        const char* dllName = (const char*)(b + desc->Name);
+        HMODULE mod = LL(dllName);
+        if (!mod) return;
+        ULONGLONG* orig = (ULONGLONG*)(b + (desc->OriginalFirstThunk
+                                            ? desc->OriginalFirstThunk : desc->FirstThunk));
+        ULONGLONG* iat = (ULONGLONG*)(b + desc->FirstThunk);
+        for (int i = 0; orig[i]; i++) {
+            if (iat[i] != 0) continue;   // 幂等: 首次 APC/映射器已修复的槽跳过 (并发安全)
+            ULONGLONG val = 0;
+            if (orig[i] & 0x8000000000000000ULL)
+                val = (ULONGLONG)(ULONG_PTR)GPA(mod, (LPCSTR)(orig[i] & 0xFFFF));
+            else {
+                IMAGE_IMPORT_BY_NAME* ibn = (IMAGE_IMPORT_BY_NAME*)(b + orig[i]);
+                val = (ULONGLONG)(ULONG_PTR)GPA(mod, ibn->Name);
+            }
+            if (!val) return;
+            iat[i] = val;
+        }
+        off += sizeof(IMAGE_IMPORT_DESCRIPTOR);
+    }
+
+    // 3. 执行 DllMain (幂等: g_attached 防重复初始化)
+    typedef BOOL (WINAPI* Entry_t)(HMODULE, DWORD, LPVOID);
+    Entry_t entry = (Entry_t)(b + nt->OptionalHeader.AddressOfEntryPoint);
+    entry((HMODULE)base, DLL_PROCESS_ATTACH, NULL);
+}
+
+//--------------------------------------------------------------------------
 // UDP 上报已移除 (V68): 游戏进程内不再创建 socket / 不做任何网络调用。
 // 状态仅通过共享内存 Local\MCCombatStatus_<pid> 对外发布。
 //--------------------------------------------------------------------------

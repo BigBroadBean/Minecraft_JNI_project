@@ -14,6 +14,29 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <jni.h>
+#include <stdio.h>
+
+// 崩溃记录器: 定位注入/APC 期间的未处理异常 (写入 user.dir 的 swapstub_crash.txt)
+static LONG WINAPI CrashLog(PEXCEPTION_POINTERS ep)
+{
+    FILE* f = fopen("swapstub_crash.txt", "a");
+    if (f) {
+        MEMORY_BASIC_INFORMATION mbi = {};
+        VirtualQuery(ep->ExceptionRecord->ExceptionAddress, &mbi, sizeof(mbi));
+        fprintf(f, "code=%08X at=%p page=%p prot=0x%lX rip=%p tid=%lu faultAddr=%p rax=%p r13=%p rbx=%p\n",
+                ep->ExceptionRecord->ExceptionCode,
+                ep->ExceptionRecord->ExceptionAddress,
+                mbi.BaseAddress, mbi.Protect,
+                (void*)ep->ContextRecord->Rip,
+                GetCurrentThreadId(),
+                (void*)ep->ExceptionRecord->ExceptionInformation[1],
+                (void*)ep->ContextRecord->Rax,
+                (void*)ep->ContextRecord->R13,
+                (void*)ep->ContextRecord->Rbx);
+        fclose(f);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 
 // 注意: 必须 extern "C" —— 否则 C++ 名字修饰导致 JVM 按符号名
 // Java_TestSwapClient_swap 查找失败 (UnsatisfiedLinkError)。
@@ -22,6 +45,8 @@ JNIEXPORT void JNICALL Java_TestSwapClient_swap(JNIEnv* env, jclass cls)
 {
     (void)env;
     (void)cls;
+    static bool first = true;
+    if (first) { AddVectoredExceptionHandler(1, CrashLog); first = false; }
     // 控制台窗口 DC 不是双缓冲 GL 表面, SwapBuffers 会返回 FALSE ——
     // 这无关紧要: 钩子链在进入真实函数前就已触发, 我们只借这条调用路径。
     HWND w = GetConsoleWindow();

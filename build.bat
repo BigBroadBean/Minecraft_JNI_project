@@ -3,7 +3,7 @@ setlocal
 set "GCC=C:\Users\11407\scoop\apps\gcc\current\bin\g++.exe"
 if not exist "%GCC%" (echo [!!] g++ not found: %GCC% & exit /b 1)
 echo === build MCCombatStatusJni.dll ===
-"%GCC%" -shared -O2 -std=c++17 -static-libgcc -static-libstdc++ -Wl,--retain-symbols-file=symkeep.txt -Iinclude -Iinclude\win32 -o MCCombatStatusJni.dll src\MCCombatStatusJni.cpp -lws2_32
+"%GCC%" -shared -O2 -std=c++17 -static-libgcc -static-libstdc++ -Wl,--image-base=0x13E000000 -Wl,--retain-symbols-file=symkeep.txt -Iinclude -Iinclude\win32 -o MCCombatStatusJni.dll src\MCCombatStatusJni.cpp
 if errorlevel 1 goto :err
 echo === generate src\payload.h (XOR 加密载荷) ===
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\gen_payload.ps1
