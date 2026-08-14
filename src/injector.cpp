@@ -346,7 +346,6 @@ static bool ManualMap(HANDLE proc, const BYTE* img, size_t imgSize)
                 if (v >= prefBase && v < prefBase + sizeOfImage) {
                     ULONGLONG nv = v + delta;
                     WriteProcessMemory(proc, base + va + o, &nv, 8, NULL);
-                            va + o, (unsigned long long)v, (unsigned long long)nv);
                 }
             }
         }
