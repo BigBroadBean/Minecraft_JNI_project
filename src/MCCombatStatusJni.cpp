@@ -1137,6 +1137,7 @@ enum {
 static int      g_stage     = ST_CLS;
 static int      g_probeIdx  = 0;   // 探测进度 (launch 验证 / 线程后备探测共用)
 static int      g_mapIdx    = 0;   // 映射表进度
+static int      g_mapStart  = 0;   // 本轮全表尝试的起点 (环境感知, wrap 后回到这里)
 static bool     g_mapWrap   = false;// 全表轮完, 等待重试
 static DWORD    g_retryAt   = 0;   // 全表重试时间点
 static DWORD    g_scanStart = 0;   // 线程遍历总超时起点
@@ -1308,6 +1309,32 @@ static int ThreadScanStep(JNIEnv* env, DWORD now, DWORD deadline)
 }
 
 //--------------------------------------------------------------------------
+// 按命名空间前缀 + 版本数字 tag 找映射表索引 (找不到返回 -1)。
+// 环境感知优化用: 探测到 neoforge/forge/fabric 后直接定位对应命名空间,
+// 跳过逐张失败的全表轮询 (NeoForge 的 CCNFE 异常路径极慢, 全表要几十秒)。
+//--------------------------------------------------------------------------
+static int FindMapByNamespace(const char* ns, const char* version)
+{
+    char tag[32];
+    size_t n = 0;
+    for (const char* p = version; *p && n < sizeof(tag) - 1; ++p)
+        if (*p >= '0' && *p <= '9') tag[n++] = *p;
+    tag[n] = 0;
+    if (n == 0) return -1;
+    size_t nsLen = strlen(ns);
+    for (int i = 0; i < kGenMapCount; ++i) {
+        const char* name = kGenMaps[i].name;
+        if (strncmp(name, ns, nsLen) != 0) continue;
+        size_t nameLen = strlen(name);
+        size_t digits = 0;
+        while (digits < nameLen && name[nameLen - 1 - digits] >= '0' &&
+               name[nameLen - 1 - digits] <= '9') digits++;
+        if (digits == n && strncmp(name + nameLen - n, tag, n) == 0) return i;
+    }
+    return -1;
+}
+
+//--------------------------------------------------------------------------
 // 每帧泵: 解析状态机 + 采样上报 (时间预算化, 绝不阻塞渲染线程)
 //--------------------------------------------------------------------------
 static void PumpInner(JNIEnv* env, DWORD now)
@@ -1419,6 +1446,20 @@ static void PumpInner(JNIEnv* env, DWORD now)
         int start = (g_verHint >= 0) ? g_verHint
                   : DetectVersionHint(env, g_useGameLoader ? g_gameLoader : g_sysLoader,
                                       g_clsCls, g_forName, now + kLaunchVerifyBudgetMs);
+        // 环境感知优化: 按探测到的 mod 加载器直接定位命名空间表,
+        // 跳过逐张失败的全表轮询 (NeoForge 的 CCNFE 异常路径极慢)。
+        // 解析失败仍会向后轮询 + wrap 全表, 回退逻辑不变。
+        if (g_verHint >= 0 && g_status->envName[0]) {
+            const char* ns = NULL;
+            if (strstr(g_status->envName, "neoforge")) ns = "mojang";          // NeoForge 1.20.2+: 全 Mojang
+            else if (strstr(g_status->envName, "fabric")) ns = "intermediary"; // Fabric: intermediary
+            else if (strstr(g_status->envName, "forge")) ns = "forge";         // Forge: MCP+SRG / Mojang+stable
+            if (ns) {
+                int hint2 = FindMapByNamespace(ns, g_gameVer);
+                if (hint2 >= 0) start = hint2;
+            }
+        }
+        g_mapStart = start;
         g_mapIdx = start;
         g_mapWrap = false;
         g_status->failLog[0] = 0;
@@ -1430,7 +1471,7 @@ static void PumpInner(JNIEnv* env, DWORD now)
         if (g_mapWrap) {
             if (now < g_retryAt) return;
             g_mapWrap = false;
-            g_mapIdx = (g_verHint >= 0) ? g_verHint : 0;
+            g_mapIdx = g_mapStart;
             g_status->failLog[0] = 0;
         }
         DWORD deadline = now + kFrameBudgetMs;
@@ -1539,7 +1580,7 @@ static void PumpInner(JNIEnv* env, DWORD now)
                 g_resMap = NULL;
                 g_status->ready = 0;
                 CopyName(g_status->mappingName, sizeof(g_status->mappingName), NULL);
-                g_mapIdx = (g_verHint >= 0) ? g_verHint : 0;
+                g_mapIdx = g_mapStart;
                 g_mapWrap = false;
                 g_stage = ST_MAPS;
                 return;
