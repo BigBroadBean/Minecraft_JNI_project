@@ -16,6 +16,8 @@ verify/mini.log
 # 注意: 内含 Mojang 官方映射文件 (禁止再分发) 与大量调试临时文件
 verify/*
 !verify/README.md
+!verify/hooktest.cpp
+!verify/hooktest.exe
 
 # ===== 假客户端编译输出 =====
 test/out/
