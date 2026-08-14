@@ -3,6 +3,8 @@
 > 原项目名 **MCCanAttack-JNI**（仓库/目录沿用历史名称）。
 > V63 起 DLL、共享内存、导出函数全面更名（见"接口变更"一节），
 > 外部程序需同步适配。
+> V66 起注入器改为**手动映射**（无 LoadLibrary / 无模块链表条目 /
+> 载荷加密内嵌），DLL **导出表已剥离**（见"接口变更"）。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -63,13 +65,14 @@ canPlace = (player.getHeldItem() / getMainHandItem() != null)   // 手持有物�
 ```
 MCCombatStatus-JNI/
 ├── build.bat                 一键编译 (需要 MinGW-w64 g++)
-├── MCCombatStatusJni.dll     注入到游戏进程的 JNI 工具 DLL (检测 + UDP 上报)
-├── injector.exe              注入器 (注入即退出, 无显示)
+├── MCCombatStatusJni.dll     注入到游戏进程的 JNI 工具 DLL (检测 + UDP 上报, V66 无导出)
+├── injector.exe              V66 手动映射注入器 (DLL XOR 加密内嵌, 注入即退出, 不落盘)
 ├── include/                  JNI/JVMTI 头文件
 ├── src/
 │   ├── MCCombatStatusJni.cpp 注入 DLL 源码 (映射表自动生成 + 环境探测 + UDP 上报)
 │   ├── mc_maps_generated.h   自动生成的映射表 (54 版本 171 张, 勿手改)
-│   └── injector.cpp          注入器源码
+│   ├── payload.h             自动生成的加密载荷 (build.bat 生成, 勿手改)
+│   └── injector.cpp          V66 手动映射注入器源码
 ├── tools/
 │   ├── gen_maps.py           映射表生成器 (从 mappings-extracted 生成 + 查询 CLI)
 │   ├── smoke_test.py         端到端冒烟测试 (假客户端+注入+UDP 采样)
@@ -87,12 +90,12 @@ MCCombatStatus-JNI/
 ## 使用方法
 
 1. 启动游戏（上述任一环境），进入世界。
-2. 运行 `injector.exe`（与 DLL 同一目录），注入即退出：
+2. 运行 `injector.exe`（单文件即可，DLL 已加密内嵌，**不落盘**），注入即退出：
    ```
-   injector.exe                       自动查找 Minecraft 窗口并注入
+   injector.exe                       自动查找 Minecraft 窗口并注入 (嵌入载荷)
    injector.exe -pid <PID>            手动指定进程 (注意: javapath 垫片会派生真 JVM, 要注入子进程)
-   injector.exe -dll <路径>           指定 DLL 文件 (绕过同名缓存)
-   injector.exe -title <子串>         按窗口标题查找 (默认 "Minecraft")
+   injector.exe -title <子串>         按窗口标题子串查找 (默认 "Minecraft")
+   injector.exe -dll <路径>           用指定明文 DLL 文件替代嵌入载荷
    ```
 3. DLL 注入后在游戏渲染帧内检测（帧驱动、5ms 节流，不再有自己的采集线程），
    并向本机 **35785 端口 (UDP)** 持续发送
@@ -110,18 +113,13 @@ MCCombatStatus-JNI/
 > 旧版的实时状态显示与 probe.log 诊断日志已移除；需要调试信息时可通过
 > 共享内存 `Local\MCCombatStatus_<pid>` 读取（字段含义见下文）。
 
-## 导出函数 (供其他程序调用)
+## 导出函数
 
-| 函数 | 说明 |
-|---|---|
-| `BOOL GetCanAttackNow()` | 直接返回当前是否能攻击 |
-| `BOOL IsJniReady()` | JNI 是否已就绪 |
-| `BOOL GetCombatStatus(CombatStatus*)` | 拷贝完整状态结构（含 map/env/canPlace 字段） |
-
-其他程序可通过共享内存 `Local\MCCombatStatus_<pid>` (结构见
+V66 起 DLL **不再导出任何函数**（导出表已剥离，缩小检测面）。外部程序
+只需通过共享内存 `Local\MCCombatStatus_<pid>` (结构见
 `MCCombatStatusJni.cpp` 顶部) 读取状态，无需调用 DLL 函数。
 
-## 接口变更 (V63)
+## 接口变更 (V63 / V66)
 
 V63 起项目外部接口全面更名（原 `MCCanAttack` 前缀 → `MCCombatStatus`）：
 
@@ -135,6 +133,16 @@ V63 起项目外部接口全面更名（原 `MCCanAttack` 前缀 → `MCCombatSt
 
 UDP 35785 协议（2 字节 `[canAttack][canPlace]`）不变。调用 DLL 函数
 或读共享内存的外部程序需按新名适配。
+
+### V66（2026-08）
+
+| 项 | 旧 (V65-) | 新 (V66+) |
+|---|---|---|
+| 注入方式 | CreateRemoteThread + LoadLibrary | **手动映射**（无 LoadLibrary / 无 LoadImage 回调 / PEB 模块链表无条目 / 载荷 XOR 加密内嵌不落盘） |
+| 导出函数 | `GetCanAttackNow()` / `IsJniReady()` / `GetCombatStatus()` | **全部剥离**（共享内存是唯一接口） |
+| 进程句柄 | 全权限 | 最小权限 (CREATE_THREAD\|QUERY_INFORMATION\|VM_OPERATION\|VM_WRITE\|VM_READ) |
+| 反重复注入 | — | 共享内存 `Local\MCCombatStatus_<pid>` 健康检查 |
+| DLL 内部 | 明文字符串 + 有导出 + PEB 可见 | 字符串 XOR 混淆 + 导出剥离 + PEB 摘链/名称抹除 + PE 头内存擦除 |
 
 ## 测试方法（不需要开真实游戏）
 
@@ -233,6 +241,32 @@ python tools\gen_maps.py --report --versions 1.16.5 1.21.11
    内存 `Local\MCCombatStatus_<pid>` 的**协议与 V63/V64 完全一致**。
 6. 任何程序监听 35785 端口即可获得实时状态（无需调用 DLL 函数）；
    也可读取共享内存获取完整状态（含 map/env 等诊断字段）。
+
+## 原理说明 (V66: 手动映射注入 + 反检测加固)
+
+1. `injector.exe` 把 DLL 以 **XOR 加密形式内嵌**在自身（`src/payload.h`，
+   由 `build.bat` 调 `tools/gen_payload.ps1` 生成），运行时解密到内存，
+   **全程不落盘**；`-dll <路径>` 可改用指定明文 DLL 文件。
+2. 注入流程：解析 PE → 目标进程 `VirtualAllocEx(RW)` 分配映像大小缓冲 →
+   按节区 **RVA 布局**拷贝（节区文件偏移≠RVA，这是首个大坑）→ 应用基址
+   重定位（DIR64）+ **MinGW 伪重定位**（`___RUNTIME_PSEUDO_RELOC_LIST__`，
+   COFF 符号表定位，含 `-O2` 下空表情形）→ 启发式补修无标准重定位条目的
+   `.rdata` 绝对指针（值落在首选基址映像范围内）→ 本地解析导入
+   (KERNEL32/msvcrt/WS2_32) 写入 IAT → 入口存根（`PAGE_EXECUTE_READWRITE`）
+   远程线程执行 `DllMain(base, DLL_PROCESS_ATTACH)` → 节区权限改 RX。
+   全程**不调用 LoadLibrary**：无 LoadImage 回调、PEB 模块链表无条目。
+3. `OpenProcess` 仅申请最小权限；注入前检查共享内存
+   `Local\MCCombatStatus_<pid>` 是否健康（反重复注入）。
+4. DLL 本体反检测（V66）：敏感字符串 XOR 混淆（volatile 数组防 `-O2`
+   常量折叠）、导出表剥离、PEB 摘链 + 全/基名抹除、PE 头内存擦除。
+5. 游戏内检测/上报架构与 V65 完全一致（帧驱动 SwapBuffers 钩子、无线程、
+   无 AttachCurrentThread）；共享内存 + UDP 35785 协议不变。
+   验证：swapclient 假客户端上 `injector.exe -pid <真JVM>` 手动映射注入
+   后 `ready=1 map=mojang1201`，阶段状态全部正确。
+
+> 手动映射的两个经典坑（详见《避坑指南》）：映射映像必须按 RVA 布局、
+> 节区拷贝必须读文件缓冲而非 RVA 缓冲；MinGW 的 `.refptr` 绝对指针没有
+> 标准重定位条目，需要"值落在首选基址范围内"的启发式补修。
 
 > 完整原理、真机排查过程与踩坑记录见《技术文档.md》和《避坑指南.md》。
 >
