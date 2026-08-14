@@ -94,6 +94,7 @@ static const volatile unsigned char kEnc_gdi32_dll[] = { 0x3D, 0x3E, 0x33, 0x69,
 static const volatile unsigned char kEnc_SwapBuffers[] = { 0x09, 0x2D, 0x3B, 0x2A, 0x18, 0x2F, 0x3C, 0x3C, 0x3F, 0x28, 0x29 };
 static const volatile unsigned char kEnc_gdi32full_dll[] = { 0x3D, 0x3E, 0x33, 0x69, 0x68, 0x3C, 0x2F, 0x36, 0x36, 0x74, 0x3E, 0x36, 0x36 };
 static const volatile unsigned char kEnc_loopback[] = { 0x6B, 0x68, 0x6D, 0x74, 0x6A, 0x74, 0x6A, 0x74, 0x6B };
+static const volatile unsigned char kEnc_ws2_32_dll[] = { 0x2D, 0x29, 0x68, 0x05, 0x69, 0x68, 0x74, 0x3E, 0x36, 0x36 };
 
 static const DWORD kMagic      = 0x4D435354; // 'MCST'
 static const DWORD kVersion    = 7;
@@ -104,6 +105,43 @@ static CombatStatus*  g_status = NULL;
 // UDP 上报: 向本机 35785 端口发送 0/1 (1=可以攻击, 0=不可以)
 static SOCKET               g_sock = INVALID_SOCKET;
 static struct sockaddr_in   g_dst;
+
+//--------------------------------------------------------------------------
+// V66.2: ws2_32 动态解析 (不静态导入)。手动映射时目标进程若未加载
+// ws2_32, 静态 IAT 里的 WSAStartup 等地址在目标里是未映射区域, 首次调用
+// 直接 0xC0000005 (无网络功能的进程上实测崩溃)。动态解析失败 = 目标没有
+// ws2_32 -> 跳过 UDP, 共享内存通道不受影响 (真实游戏必然已加载)。
+//--------------------------------------------------------------------------
+typedef int  (WINAPI* WSAStartup_t)(WORD, WSADATA*);
+typedef SOCKET (WINAPI* socket_t)(int, int, int);
+typedef int  (WINAPI* sendto_t)(SOCKET, const char*, int, int, const struct sockaddr*, int);
+typedef int  (WINAPI* closesocket_t)(SOCKET);
+typedef int  (WINAPI* WSACleanup_t)(void);
+typedef unsigned long (WINAPI* inet_addr_t)(const char*);
+static WSAStartup_t   pWSAStartup  = NULL;
+static socket_t       pSocket      = NULL;
+static sendto_t       pSendto      = NULL;
+static closesocket_t  pClosesocket = NULL;
+static WSACleanup_t   pWSACleanup  = NULL;
+static inet_addr_t    pInetAddr    = NULL;
+static HMODULE        g_ws2        = NULL;
+
+static bool ResolveWs2(void)
+{
+    if (g_ws2) return true;
+    HMODULE m = GetModuleHandleA(XS(kEnc_ws2_32_dll, sizeof(kEnc_ws2_32_dll)));
+    if (!m) return false;
+    pWSAStartup  = (WSAStartup_t)(void*)GetProcAddress(m, "WSAStartup");
+    pSocket      = (socket_t)(void*)GetProcAddress(m, "socket");
+    pSendto      = (sendto_t)(void*)GetProcAddress(m, "sendto");
+    pClosesocket = (closesocket_t)(void*)GetProcAddress(m, "closesocket");
+    pWSACleanup  = (WSACleanup_t)(void*)GetProcAddress(m, "WSACleanup");
+    pInetAddr    = (inet_addr_t)(void*)GetProcAddress(m, "inet_addr");
+    if (!pWSAStartup || !pSocket || !pSendto || !pClosesocket || !pWSACleanup || !pInetAddr)
+        return false;
+    g_ws2 = m;
+    return true;
+}
 
 static void CopyName(char* dst, size_t cap, const char* src); // 前向声明
 static jclass FindLoadedGameClass(JNIEnv* env, jobject loader, const char* name,
@@ -673,11 +711,11 @@ static void CopyName(char* dst, size_t cap, const char* src)
 //--------------------------------------------------------------------------
 static void SendStatus(int canAttack, int canPlace)
 {
-    if (g_sock == INVALID_SOCKET) return;
+    if (g_sock == INVALID_SOCKET || !pSendto) return;
     char b[2];
     b[0] = canAttack ? '1' : '0';
     b[1] = canPlace  ? '1' : '0';
-    sendto(g_sock, b, 2, 0, (const struct sockaddr*)&g_dst, sizeof(g_dst));
+    pSendto(g_sock, b, 2, 0, (const struct sockaddr*)&g_dst, sizeof(g_dst));
 }
 
 //--------------------------------------------------------------------------
@@ -2067,15 +2105,16 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
         g_status->pid     = GetCurrentProcessId();
         CopyName(g_status->errMsg, sizeof(g_status->errMsg), "H0:dllmain-init");
 
-        // UDP: 初始化 socket, 目标为本机 35785 端口 (协议不变)
+        // UDP: 初始化 socket, 目标为本机 35785 端口 (协议不变)。
+        // ws2_32 动态解析: 目标未加载时跳过 UDP (共享内存不受影响)。
         WSADATA wsa;
-        if (WSAStartup(MAKEWORD(2, 2), &wsa) == 0) {
-            g_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (ResolveWs2() && pWSAStartup(MAKEWORD(2, 2), &wsa) == 0) {
+            g_sock = pSocket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
             if (g_sock != INVALID_SOCKET) {
                 memset(&g_dst, 0, sizeof(g_dst));
                 g_dst.sin_family      = AF_INET;
-                g_dst.sin_port        = htons(35785);
-                g_dst.sin_addr.s_addr = inet_addr(XS(kEnc_loopback, sizeof(kEnc_loopback)));
+                g_dst.sin_port        = 0xC98B;   // htons(35785), 常量避免 ws2_32 导入
+                g_dst.sin_addr.s_addr = pInetAddr(XS(kEnc_loopback, sizeof(kEnc_loopback)));
             }
         }
 
@@ -2094,8 +2133,8 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
 #endif
     }
     else if (reason == DLL_PROCESS_DETACH) {
-        if (g_sock != INVALID_SOCKET) { closesocket(g_sock); g_sock = INVALID_SOCKET; }
-        WSACleanup();
+        if (g_sock != INVALID_SOCKET) { if (pClosesocket) pClosesocket(g_sock); g_sock = INVALID_SOCKET; }
+        if (g_ws2 && pWSACleanup) pWSACleanup();
         if (g_status) { UnmapViewOfFile(g_status); g_status = NULL; }
         if (g_map)    { CloseHandle(g_map);    g_map    = NULL; }
         // 钩子有意不还原: DLL 与进程同生命周期, 进程退出阶段还原补丁
