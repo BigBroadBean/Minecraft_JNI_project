@@ -202,6 +202,6 @@ int main(int argc, char** argv)
     // 注入
     printf("[*] 注入 %s ...\n", dllPath);
     if (!InjectDll(pid, dllPath)) return 1;
-    printf("[+] 注入完成。DLL 将向本机 35785 端口 UDP 上报 2 字节 (byte0=可以攻击 1/0, byte1=手持放置物 1/0)。\n");
+    printf("[+] 注入完成。状态经共享内存 Local\\MCCombatStatus_<pid> 发布 (UDP 已移除)。\n");
     return 0;
 }
