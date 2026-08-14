@@ -142,7 +142,7 @@ UDP 35785 协议（2 字节 `[canAttack][canPlace]`）不变。调用 DLL 函数
 | 导出函数 | `GetCanAttackNow()` / `IsJniReady()` / `GetCombatStatus()` | **全部剥离**（共享内存是唯一接口） |
 | 进程句柄 | 全权限 | 最小权限 (CREATE_THREAD\|QUERY_INFORMATION\|VM_OPERATION\|VM_WRITE\|VM_READ) |
 | 反重复注入 | — | 共享内存 `Local\MCCombatStatus_<pid>` 健康检查 |
-| DLL 内部 | 明文字符串 + 有导出 + PEB 可见 | 字符串 XOR 混淆 + 导出剥离 + PEB 摘链/名称抹除 + PE 头内存擦除 |
+| DLL 内部 | 明文字符串 + 有导出 + PEB 可见 | 字符串 XOR 混淆 + 导出剥离（PEB 摘链/头抹除**默认关闭**, 见 V66.1） |
 
 ## 测试方法（不需要开真实游戏）
 
@@ -258,7 +258,9 @@ python tools\gen_maps.py --report --versions 1.16.5 1.21.11
 3. `OpenProcess` 仅申请最小权限；注入前检查共享内存
    `Local\MCCombatStatus_<pid>` 是否健康（反重复注入）。
 4. DLL 本体反检测（V66）：敏感字符串 XOR 混淆（volatile 数组防 `-O2`
-   常量折叠）、导出表剥离、PEB 摘链 + 全/基名抹除、PE 头内存擦除。
+   常量折叠）、导出表剥离。**PEB 摘链 + 名称抹除、PE 头内存擦除默认关闭**
+   （V66.1）：网易版真机实测这两项会让反作弊把模块判为"隐藏/篡改模块"
+   进黑屋；需要时改源码 `HIDE_MODULE_ANTI_DETECT` 重新编译。
 5. 游戏内检测/上报架构与 V65 完全一致（帧驱动 SwapBuffers 钩子、无线程、
    无 AttachCurrentThread）；共享内存 + UDP 35785 协议不变。
    验证：swapclient 假客户端上 `injector.exe -pid <真JVM>` 手动映射注入

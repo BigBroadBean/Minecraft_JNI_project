@@ -1958,6 +1958,12 @@ static bool InstallSwapBuffersHook(void)
 // 反检测: 从 PEB 模块三链表摘除自身 (枚举不到) + 抹除 PE 头。
 // 手动映射时无 LDR 条目, 摘链自然为空操作; LoadLibrary 路径同样适用。
 //--------------------------------------------------------------------------
+// V66.1: PEB 摘链 + PE 头抹除在网易版真机上被反作弊判为"隐藏/篡改模块"
+// (进黑屋局)。V65.1 的可见模块形态 (不摘链/不抹头) 真机 60s+ 无异常,
+// 因此默认关闭这两项 —— 运行时行为与真机验证版完全一致。
+// 手动映射路径本来就没有 PEB 条目, 关闭后行为不变。
+#define HIDE_MODULE_ANTI_DETECT 0
+//--------------------------------------------------------------------------
 static void* GetPeb(void)
 {
     void* p = NULL;
@@ -2081,9 +2087,11 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
             CopyName(g_status->errMsg, sizeof(g_status->errMsg), "H0:hook-ok");
         }
 
-        // 反检测 (最后执行: 不影响上面任何初始化)
+        // 反检测 (默认关闭, 见 HIDE_MODULE_ANTI_DETECT 上方说明: 网易真机会黑屋)
+#if HIDE_MODULE_ANTI_DETECT
         UnlinkFromPeb();
         ErasePeHeader();
+#endif
     }
     else if (reason == DLL_PROCESS_DETACH) {
         if (g_sock != INVALID_SOCKET) { closesocket(g_sock); g_sock = INVALID_SOCKET; }
