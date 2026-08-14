@@ -68,9 +68,13 @@ MCCombatStatus-JNI/
 │   └── injector.cpp          注入器源码
 ├── tools/
 │   ├── gen_maps.py           映射表生成器 (从 mappings-extracted 生成 + 查询 CLI)
-│   └── smoke_test.py         端到端冒烟测试 (假客户端+注入+UDP 采样)
+│   ├── smoke_test.py         端到端冒烟测试 (假客户端+注入+UDP 采样)
+│   └── smoke_test_hook.py    V65 hook 版冒烟测试 (渲染线程调 SwapBuffers 假客户端)
 ├── test/                     假客户端测试 (7 套: 各命名体系一套)
+│   └── swapclient/           V65 hook 版假客户端 (Java 线程每 10ms 调 gdi32!SwapBuffers)
+│       └── native/swapstub.cpp  调用真实 SwapBuffers 的辅助库 (必须 extern "C")
 ├── verify/                   验证工具 (jmap/jcmd 记录等)
+│   └── hooktest.cpp          SwapBuffers 钩子链路独立验证 (追跳存根/槽位替换)
 ├── JNI零基础教学.md           零基础入门教程
 ├── 技术文档.md                总思路 + 架构原理 + 调试历程 + Forge 规律
 └── 避坑指南.md                JNI/注入开发避坑清单
@@ -82,11 +86,12 @@ MCCombatStatus-JNI/
 2. 运行 `injector.exe`（与 DLL 同一目录），注入即退出：
    ```
    injector.exe                       自动查找 Minecraft 窗口并注入
-   injector.exe -pid <PID>            手动指定进程
+   injector.exe -pid <PID>            手动指定进程 (注意: javapath 垫片会派生真 JVM, 要注入子进程)
    injector.exe -dll <路径>           指定 DLL 文件 (绕过同名缓存)
    injector.exe -title <子串>         按窗口标题查找 (默认 "Minecraft")
    ```
-3. DLL 注入后每 5ms 检测一次，并向本机 **35785 端口 (UDP)** 持续发送
+3. DLL 注入后在游戏渲染帧内检测（帧驱动、5ms 节流，不再有自己的采集线程），
+   并向本机 **35785 端口 (UDP)** 持续发送
    2 字节：
    ```
    byte0 = 0x31 ('1') = 当前可以攻击准星所指的生物
@@ -155,6 +160,11 @@ Forge/launchwrapper 的多加载器问题——**真机验证不可替代**（�
 `canAttack/canPlace` 组合是否符合预期。注意它依赖假客户端的
 `Minecraft` 窗口标题，且 JDK 版本需与假客户端匹配。
 
+**V65 hook 版冒烟测试**（验证帧驱动链路）：`tools/smoke_test_hook.py` 一键完成
+"编译启动 swapclient（Java 线程每 10ms 调真实 gdi32!SwapBuffers）→ 注入 →
+读共享内存 + UDP 采样"；`verify/hooktest.exe`（build 后运行）独立验证
+SwapBuffers 钩子链路本身（追跳存根 → 槽位原子替换 → 调用转发），不涉及 JNI。
+
 ## 重新编译
 
 ```
@@ -179,8 +189,8 @@ build.bat
 全程不变；stable 名 `m_91087_`(getInstance) 在 1.17~1.21.11 全程不变——
 所以新增版本基本"查表即可"，无需再手写。
 **注意**：Intermediary 名（Fabric）**并非**完全跨版本稳定（如 `ItemStack.getItem`
-在 1.14 是 `method_7949`、1.21.11 是 `method_7909`），因此 DLL 靠窗口标题里的
-版本号（如 `Minecraft* 1.21.11`）来定位到正确版本的表。
+在 1.14 是 `method_7949`、1.21.11 是 `method_7909`），因此 DLL 靠 JVM classpath
+里的版本号（如 `...\versions\1.21.11\1.21.11.jar`）来定位到正确版本的表。
 
 ```bash
 # 重新生成 (改动了生成器或数据后)
@@ -196,17 +206,28 @@ python tools\gen_maps.py --report --versions 1.16.5 1.21.11
 
 > 数据目录路径 `BASE` 在 `gen_maps.py` 顶部，换机器时改这一处即可。
 
-## 原理说明
+## 原理说明 (V65: 无线程/无 Attach 的帧驱动架构)
 
 1. `injector.exe` 找到 java/javaw 进程后，用
    `CreateRemoteThread + LoadLibraryA` 注入 `MCCombatStatusJni.dll`。
-2. DLL 内工作线程通过 `JNI_GetCreatedJavaVMs` 拿到 JavaVM 并 `AttachCurrentThread`，
-   找到游戏类加载器（`Launch.classLoader`，注意字段类型是 `LaunchClassLoader`！），
-   用 JNI 反射解析 Minecraft 类/字段/方法 ID（按 classpath 版本号定位后，依次尝试该版本的映射表）。
-3. 每 5ms 计算一次 canAttack / canPlace，通过 UDP 向本机 35785 端口
-   发送 2 字节 (byte0=canAttack, byte1=canPlace)，并写入共享内存
-   `Local\MCCombatStatus_<pid>`。
-4. 任何程序监听 35785 端口即可获得实时状态（无需调用 DLL 函数）；
+2. DLL 入口（DllMain）**不创建任何线程**：只初始化共享内存与 UDP socket，
+   并钩住 `gdi32!SwapBuffers` —— 游戏自己的 Client thread（Java 线程）
+   每帧渲染都调用它（LWJGL2 的 WindowsDisplay 与 LWJGL3/GLFW 的 WGL
+   后端最终都调 `gdi32!SwapBuffers`）。钩子安装时追跳存根链（FF 25/E9），
+   对热补丁槽位做 8 字节原子指针替换（已处理"槽位惰性解析"问题）。
+3. 钩子内用 `GetEnv()` **复用**该渲染线程已有的 JNIEnv（Java 线程天然
+   attached）——**绝不调用 `AttachCurrentThread`**：那会在 JVM 里注册一个
+   "外来原生线程"并触发 ThreadStart 事件，网易版等游戏侧保护发现后直接
+   退出游戏（旧版 V64- 恰恰是 "CreateThread 采集线程 + AttachCurrentThread"
+   组合，即被强杀的导火索）。
+4. 解析与采样由**帧驱动状态机**在渲染线程内完成：环境探测 → 加载器定位
+   （Launch.classLoader / 线程遍历，可分帧续跑）→ 按 classpath 版本号定位
+   后依次尝试映射表 → findLoadedClass 终极修正 → 采样（5ms 节流）。
+   每帧工作预算 8ms，解析失败下帧续跑，绝不阻塞渲染线程。
+5. 跨帧保留的 jclass/jobject 一律 `NewGlobalRef` 提升（本地引用在 native
+   帧返回时即失效）；离开钩子前清空 pending exception；UDP 2 字节 + 共享
+   内存 `Local\MCCombatStatus_<pid>` 的**协议与 V63/V64 完全一致**。
+6. 任何程序监听 35785 端口即可获得实时状态（无需调用 DLL 函数）；
    也可读取共享内存获取完整状态（含 map/env 等诊断字段）。
 
 > 完整原理、真机排查过程与踩坑记录见《技术文档.md》和《避坑指南.md》。
