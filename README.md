@@ -3,8 +3,9 @@
 > 原项目名 **MCCanAttack-JNI**（仓库/目录沿用历史名称）。
 > V63 起 DLL、共享内存、导出函数全面更名（见"接口变更"一节），
 > 外部程序需同步适配。
-> V66 起注入器改为**手动映射**（无 LoadLibrary / 无模块链表条目 /
-> 载荷加密内嵌），DLL **导出表已剥离**（见"接口变更"）。
+> V66 起注入器改为**手动映射**；**V68 起**: UDP 通道移除（仅共享内存）、
+> gdi32 零修改（VEH 页保护钩子）、线程劫持执行（不创建新线程）、
+> 优先镜像节区映射（MEM_IMAGE + PEB 模块注册）。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -97,18 +98,12 @@ MCCombatStatus-JNI/
    injector.exe -title <子串>         按窗口标题子串查找 (默认 "Minecraft")
    injector.exe -dll <路径>           用指定明文 DLL 文件替代嵌入载荷
    ```
-3. DLL 注入后在游戏渲染帧内检测（帧驱动、5ms 节流，不再有自己的采集线程），
-   并向本机 **35785 端口 (UDP)** 持续发送
-   2 字节：
+3. DLL 注入后在游戏渲染帧内检测（帧驱动、5ms 节流，不再有自己的采集线程）。
+   **V68 起状态仅通过共享内存发布**（UDP 35785 通道已移除——游戏进程内
+   不再创建任何 socket，规避对进程网络行为的检查）：
    ```
-   byte0 = 0x31 ('1') = 当前可以攻击准星所指的生物
-          0x30 ('0') = 不可以
-   byte1 = 0x31 ('1') = 手持物品是放置物 (ItemBlock/BlockItem)
-          0x30 ('0') = 不是或空手
+   共享内存: Local\MCCombatStatus_<pid>  (magic 'MCST' v7, 结构见 DLL 源码顶部)
    ```
-   接收方无需应答，直接收 UDP 包即可。**byte0 与旧版 1 字节协议完全
-   一致**，旧接收端（只读 byte0）无需改动；新接收端 `recvfrom(2)`
-   一次拿到两个状态。
 
 > 旧版的实时状态显示与 probe.log 诊断日志已移除；需要调试信息时可通过
 > 共享内存 `Local\MCCombatStatus_<pid>` 读取（字段含义见下文）。
@@ -276,3 +271,29 @@ python tools\gen_maps.py --report --versions 1.16.5 1.21.11
 > 存活、状态读取正确（详见《技术文档》8.7）。注意其窗口标题是服务器名
 > （不是 "Minecraft"），`injector.exe` 需 `-pid` 或 `-title` 注入；长期
 > 使用仍建议自行观察（反作弊可能还有更长周期的扫描）。
+
+## 原理说明 (V68: 运行时零痕迹注入)
+
+针对网易反作弊（`api-ms-win-crt-utility-l1-1-1.dll`，用户态、无 Ring-0，
+启动时扫描桌面/进程文件 + 启动与运行时不匹配检测），V68 把游戏进程内的
+运行时痕迹降到最低：
+
+1. **UDP 通道移除**：DLL 不再创建任何 socket（进程网络行为无变化），
+   状态仅通过共享内存 `Local\MCCombatStatus_<pid>` 发布。
+2. **VEH 页保护钩子**（替换槽位补丁）：用 `PAGE_GUARD` 保护真实
+   `SwapBuffers` 入口页，渲染线程每次进入触发 `STATUS_GUARD_PAGE_VIOLATION`，
+   VEH 处理器重定向 RIP 到钩子，钩子返回后重新武装保护页。
+   **gdi32/gdi32full 一个字节都不改** —— 完整性检查/前后比对无差异。
+3. **线程劫持执行 DllMain**（替换 CreateRemoteThread）：挂起游戏窗口线程，
+   现场全保存（GPR/RFLAGS/XMM）→ 执行 DllMain → 现场全恢复 → 跳回原
+   RIP。**不创建新线程**（无 NtCreateThreadEx 痕迹、线程数不变）。
+4. **优先镜像节区映射**：`NtCreateSection(SEC_IMAGE)` + 映射进游戏进程
+   （MEM_IMAGE 内存类型，与 LoadLibrary 一致——无"匿名可执行内存"特征），
+   映射后补重定位/导入/伪重定位（LoadLibrary 等价），并在 PEB 三链表
+   注册模块条目（枚举与内存类型一致，无"隐藏模块"特征）。首选基址不可用
+   时回退手动映射 + 线程劫持。
+5. 反重复注入、字符串混淆、导出剥离、最小权限句柄与 V66 相同。
+
+> V68 验证：swapclient 假客户端（真实 JVM + 渲染线程）+ `injector.exe`
+> 线程劫持注入：`ready=1 map=mojang1201`，JVM 全程存活无崩溃；
+> 无窗口渲染进程上 VEH 钩子正确安装（未解析槽位不再有崩溃面）。
