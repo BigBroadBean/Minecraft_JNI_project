@@ -3,9 +3,6 @@
 > 原项目名 **MCCanAttack-JNI**（仓库/目录沿用历史名称）。
 > V63 起 DLL、共享内存、导出函数全面更名（见"接口变更"一节），
 > 外部程序需同步适配。
-> V66 起注入器改为**手动映射**；**V68 起**: UDP 通道移除（仅共享内存）、
-> gdi32 零修改（VEH 页保护钩子）、线程劫持执行（不创建新线程）、
-> 优先镜像节区映射（MEM_IMAGE + PEB 模块注册）。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -66,14 +63,13 @@ canPlace = (player.getHeldItem() / getMainHandItem() != null)   // 手持有物�
 ```
 MCCombatStatus-JNI/
 ├── build.bat                 一键编译 (需要 MinGW-w64 g++)
-├── MCCombatStatusJni.dll     注入到游戏进程的 JNI 工具 DLL (检测 + UDP 上报, V66 无导出)
-├── injector.exe              V66 手动映射注入器 (DLL XOR 加密内嵌, 注入即退出, 不落盘)
+├── MCCombatStatusJni.dll     注入到游戏进程的 JNI 工具 DLL (检测 + UDP 上报)
+├── injector.exe              注入器 (注入即退出, 无显示)
 ├── include/                  JNI/JVMTI 头文件
 ├── src/
 │   ├── MCCombatStatusJni.cpp 注入 DLL 源码 (映射表自动生成 + 环境探测 + UDP 上报)
 │   ├── mc_maps_generated.h   自动生成的映射表 (54 版本 171 张, 勿手改)
-│   ├── payload.h             自动生成的加密载荷 (build.bat 生成, 勿手改)
-│   └── injector.cpp          V66 手动映射注入器源码
+│   └── injector.cpp          注入器源码
 ├── tools/
 │   ├── gen_maps.py           映射表生成器 (从 mappings-extracted 生成 + 查询 CLI)
 │   ├── smoke_test.py         端到端冒烟测试 (假客户端+注入+UDP 采样)
@@ -91,30 +87,41 @@ MCCombatStatus-JNI/
 ## 使用方法
 
 1. 启动游戏（上述任一环境），进入世界。
-2. 运行 `injector.exe`（单文件即可，DLL 已加密内嵌，**不落盘**），注入即退出：
+2. 运行 `injector.exe`（与 DLL 同一目录），注入即退出：
    ```
-   injector.exe                       自动查找 Minecraft 窗口并注入 (嵌入载荷)
+   injector.exe                       自动查找 Minecraft 窗口并注入
    injector.exe -pid <PID>            手动指定进程 (注意: javapath 垫片会派生真 JVM, 要注入子进程)
-   injector.exe -title <子串>         按窗口标题子串查找 (默认 "Minecraft")
-   injector.exe -dll <路径>           用指定明文 DLL 文件替代嵌入载荷
+   injector.exe -dll <路径>           指定 DLL 文件 (绕过同名缓存)
+   injector.exe -title <子串>         按窗口标题查找 (默认 "Minecraft")
    ```
-3. DLL 注入后在游戏渲染帧内检测（帧驱动、5ms 节流，不再有自己的采集线程）。
-   **V68 起状态仅通过共享内存发布**（UDP 35785 通道已移除——游戏进程内
-   不再创建任何 socket，规避对进程网络行为的检查）：
+3. DLL 注入后在游戏渲染帧内检测（帧驱动、5ms 节流，不再有自己的采集线程），
+   并向本机 **35785 端口 (UDP)** 持续发送
+   2 字节：
    ```
-   共享内存: Local\MCCombatStatus_<pid>  (magic 'MCST' v7, 结构见 DLL 源码顶部)
+   byte0 = 0x31 ('1') = 当前可以攻击准星所指的生物
+          0x30 ('0') = 不可以
+   byte1 = 0x31 ('1') = 手持物品是放置物 (ItemBlock/BlockItem)
+          0x30 ('0') = 不是或空手
    ```
+   接收方无需应答，直接收 UDP 包即可。**byte0 与旧版 1 字节协议完全
+   一致**，旧接收端（只读 byte0）无需改动；新接收端 `recvfrom(2)`
+   一次拿到两个状态。
 
 > 旧版的实时状态显示与 probe.log 诊断日志已移除；需要调试信息时可通过
 > 共享内存 `Local\MCCombatStatus_<pid>` 读取（字段含义见下文）。
 
-## 导出函数
+## 导出函数 (供其他程序调用)
 
-V66 起 DLL **不再导出任何函数**（导出表已剥离，缩小检测面）。外部程序
-只需通过共享内存 `Local\MCCombatStatus_<pid>` (结构见
+| 函数 | 说明 |
+|---|---|
+| `BOOL GetCanAttackNow()` | 直接返回当前是否能攻击 |
+| `BOOL IsJniReady()` | JNI 是否已就绪 |
+| `BOOL GetCombatStatus(CombatStatus*)` | 拷贝完整状态结构（含 map/env/canPlace 字段） |
+
+其他程序可通过共享内存 `Local\MCCombatStatus_<pid>` (结构见
 `MCCombatStatusJni.cpp` 顶部) 读取状态，无需调用 DLL 函数。
 
-## 接口变更 (V63 / V66)
+## 接口变更 (V63)
 
 V63 起项目外部接口全面更名（原 `MCCanAttack` 前缀 → `MCCombatStatus`）：
 
@@ -128,16 +135,6 @@ V63 起项目外部接口全面更名（原 `MCCanAttack` 前缀 → `MCCombatSt
 
 UDP 35785 协议（2 字节 `[canAttack][canPlace]`）不变。调用 DLL 函数
 或读共享内存的外部程序需按新名适配。
-
-### V66（2026-08）
-
-| 项 | 旧 (V65-) | 新 (V66+) |
-|---|---|---|
-| 注入方式 | CreateRemoteThread + LoadLibrary | **手动映射**（无 LoadLibrary / 无 LoadImage 回调 / PEB 模块链表无条目 / 载荷 XOR 加密内嵌不落盘） |
-| 导出函数 | `GetCanAttackNow()` / `IsJniReady()` / `GetCombatStatus()` | **全部剥离**（共享内存是唯一接口） |
-| 进程句柄 | 全权限 | 最小权限 (CREATE_THREAD\|QUERY_INFORMATION\|VM_OPERATION\|VM_WRITE\|VM_READ) |
-| 反重复注入 | — | 共享内存 `Local\MCCombatStatus_<pid>` 健康检查 |
-| DLL 内部 | 明文字符串 + 有导出 + PEB 可见 | 字符串 XOR 混淆 + 导出剥离（PEB 摘链/头抹除**默认关闭**, 见 V66.1） |
 
 ## 测试方法（不需要开真实游戏）
 
@@ -237,63 +234,9 @@ python tools\gen_maps.py --report --versions 1.16.5 1.21.11
 6. 任何程序监听 35785 端口即可获得实时状态（无需调用 DLL 函数）；
    也可读取共享内存获取完整状态（含 map/env 等诊断字段）。
 
-## 原理说明 (V66: 手动映射注入 + 反检测加固)
-
-1. `injector.exe` 把 DLL 以 **XOR 加密形式内嵌**在自身（`src/payload.h`，
-   由 `build.bat` 调 `tools/gen_payload.ps1` 生成），运行时解密到内存，
-   **全程不落盘**；`-dll <路径>` 可改用指定明文 DLL 文件。
-2. 注入流程：解析 PE → 目标进程 `VirtualAllocEx(RW)` 分配映像大小缓冲 →
-   按节区 **RVA 布局**拷贝（节区文件偏移≠RVA，这是首个大坑）→ 应用基址
-   重定位（DIR64）+ **MinGW 伪重定位**（`___RUNTIME_PSEUDO_RELOC_LIST__`，
-   COFF 符号表定位，含 `-O2` 下空表情形）→ 启发式补修无标准重定位条目的
-   `.rdata` 绝对指针（值落在首选基址映像范围内）→ 本地解析导入
-   (KERNEL32/msvcrt/WS2_32) 写入 IAT → 入口存根（`PAGE_EXECUTE_READWRITE`）
-   远程线程执行 `DllMain(base, DLL_PROCESS_ATTACH)` → 节区权限改 RX。
-   全程**不调用 LoadLibrary**：无 LoadImage 回调、PEB 模块链表无条目。
-3. `OpenProcess` 仅申请最小权限；注入前检查共享内存
-   `Local\MCCombatStatus_<pid>` 是否健康（反重复注入）。
-4. DLL 本体反检测（V66）：敏感字符串 XOR 混淆（volatile 数组防 `-O2`
-   常量折叠）、导出表剥离。**PEB 摘链 + 名称抹除、PE 头内存擦除默认关闭**
-   （V66.1）：网易版真机实测这两项会让反作弊把模块判为"隐藏/篡改模块"
-   进黑屋；需要时改源码 `HIDE_MODULE_ANTI_DETECT` 重新编译。
-5. 游戏内检测/上报架构与 V65 完全一致（帧驱动 SwapBuffers 钩子、无线程、
-   无 AttachCurrentThread）；共享内存 + UDP 35785 协议不变。
-   验证：swapclient 假客户端上 `injector.exe -pid <真JVM>` 手动映射注入
-   后 `ready=1 map=mojang1201`，阶段状态全部正确。
-
-> 手动映射的两个经典坑（详见《避坑指南》）：映射映像必须按 RVA 布局、
-> 节区拷贝必须读文件缓冲而非 RVA 缓冲；MinGW 的 `.refptr` 绝对指针没有
-> 标准重定位条目，需要"值落在首选基址范围内"的启发式补修。
-
 > 完整原理、真机排查过程与踩坑记录见《技术文档.md》和《避坑指南.md》。
 >
 > **网易中国版**：已在 1.20.1 Forge 端真机注入验证（2026-08-14）——游戏
 > 存活、状态读取正确（详见《技术文档》8.7）。注意其窗口标题是服务器名
 > （不是 "Minecraft"），`injector.exe` 需 `-pid` 或 `-title` 注入；长期
 > 使用仍建议自行观察（反作弊可能还有更长周期的扫描）。
-
-## 原理说明 (V68: 运行时零痕迹注入)
-
-针对网易反作弊（`api-ms-win-crt-utility-l1-1-1.dll`，用户态、无 Ring-0，
-启动时扫描桌面/进程文件 + 启动与运行时不匹配检测），V68 把游戏进程内的
-运行时痕迹降到最低：
-
-1. **UDP 通道移除**：DLL 不再创建任何 socket（进程网络行为无变化），
-   状态仅通过共享内存 `Local\MCCombatStatus_<pid>` 发布。
-2. **VEH 页保护钩子**（替换槽位补丁）：用 `PAGE_GUARD` 保护真实
-   `SwapBuffers` 入口页，渲染线程每次进入触发 `STATUS_GUARD_PAGE_VIOLATION`，
-   VEH 处理器重定向 RIP 到钩子，钩子返回后重新武装保护页。
-   **gdi32/gdi32full 一个字节都不改** —— 完整性检查/前后比对无差异。
-3. **线程劫持执行 DllMain**（替换 CreateRemoteThread）：挂起游戏窗口线程，
-   现场全保存（GPR/RFLAGS/XMM）→ 执行 DllMain → 现场全恢复 → 跳回原
-   RIP。**不创建新线程**（无 NtCreateThreadEx 痕迹、线程数不变）。
-4. **优先镜像节区映射**：`NtCreateSection(SEC_IMAGE)` + 映射进游戏进程
-   （MEM_IMAGE 内存类型，与 LoadLibrary 一致——无"匿名可执行内存"特征），
-   映射后补重定位/导入/伪重定位（LoadLibrary 等价），并在 PEB 三链表
-   注册模块条目（枚举与内存类型一致，无"隐藏模块"特征）。首选基址不可用
-   时回退手动映射 + 线程劫持。
-5. 反重复注入、字符串混淆、导出剥离、最小权限句柄与 V66 相同。
-
-> V68 验证：swapclient 假客户端（真实 JVM + 渲染线程）+ `injector.exe`
-> 线程劫持注入：`ready=1 map=mojang1201`，JVM 全程存活无崩溃；
-> 无窗口渲染进程上 VEH 钩子正确安装（未解析槽位不再有崩溃面）。

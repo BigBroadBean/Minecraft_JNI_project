@@ -74,33 +74,16 @@ struct CombatStatus {
 };
 #pragma pack(pop)
 
-//--------------------------------------------------------------------------
-// 敏感字符串运行时解码 (静态 XOR 0x5A 编码, 避免明文落入静态签名样本)。
-// 注意: g_xbuf 为单缓冲, 解码结果须立即使用 (本 DLL 全逻辑单线程执行)。
-//--------------------------------------------------------------------------
-static char g_xbuf[64];
-static const char* XS(const volatile unsigned char* e, size_t n)
-{
-    for (size_t i = 0; i < n && i + 1 < sizeof(g_xbuf); ++i)
-        g_xbuf[i] = (char)(e[i] ^ 0x5A);
-    g_xbuf[n] = 0;
-    return g_xbuf;
-}
-// volatile: 阻止编译器常量折叠 XOR 解码 (否则 -O2 会把明文直接内联进代码/常量区)
-static const volatile unsigned char kEnc_MCCombatStatus_fmt[] = { 0x17, 0x19, 0x19, 0x35, 0x37, 0x38, 0x3B, 0x2E, 0x09, 0x2E, 0x3B, 0x2E, 0x2F, 0x29, 0x05, 0x7F, 0x36, 0x2F };
-static const volatile unsigned char kEnc_jvm_dll[] = { 0x30, 0x2C, 0x37, 0x74, 0x3E, 0x36, 0x36 };
-static const volatile unsigned char kEnc_JNI_GetCreatedJavaVMs[] = { 0x10, 0x14, 0x13, 0x05, 0x1D, 0x3F, 0x2E, 0x19, 0x28, 0x3F, 0x3B, 0x2E, 0x3F, 0x3E, 0x10, 0x3B, 0x2C, 0x3B, 0x0C, 0x17, 0x29 };
-static const volatile unsigned char kEnc_gdi32_dll[] = { 0x3D, 0x3E, 0x33, 0x69, 0x68, 0x74, 0x3E, 0x36, 0x36 };
-static const volatile unsigned char kEnc_SwapBuffers[] = { 0x09, 0x2D, 0x3B, 0x2A, 0x18, 0x2F, 0x3C, 0x3C, 0x3F, 0x28, 0x29 };
-static const volatile unsigned char kEnc_gdi32full_dll[] = { 0x3D, 0x3E, 0x33, 0x69, 0x68, 0x3C, 0x2F, 0x36, 0x36, 0x74, 0x3E, 0x36, 0x36 };
-static const volatile unsigned char kEnc_loopback[] = { 0x6B, 0x68, 0x6D, 0x74, 0x6A, 0x74, 0x6A, 0x74, 0x6B };
-static const volatile unsigned char kEnc_ws2_32_dll[] = { 0x2D, 0x29, 0x68, 0x05, 0x69, 0x68, 0x74, 0x3E, 0x36, 0x36 };
-
+static const char* kMapNameFmt = "Local\\MCCombatStatus_%lu";
 static const DWORD kMagic      = 0x4D435354; // 'MCST'
 static const DWORD kVersion    = 7;
 
 static HANDLE         g_map    = NULL;
 static CombatStatus*  g_status = NULL;
+
+// UDP 上报: 向本机 35785 端口发送 0/1 (1=可以攻击, 0=不可以)
+static SOCKET               g_sock = INVALID_SOCKET;
+static struct sockaddr_in   g_dst;
 
 static void CopyName(char* dst, size_t cap, const char* src); // 前向声明
 static jclass FindLoadedGameClass(JNIEnv* env, jobject loader, const char* name,
@@ -664,120 +647,18 @@ static void CopyName(char* dst, size_t cap, const char* src)
 }
 
 //--------------------------------------------------------------------------
-// V70: APC 加载器 —— 注入器把映像映射进目标后, 用 NtQueueApcThread 在
-// 目标线程上执行本函数 (不创建新线程)。执行前提: 映像已映射、IAT 可能
-// 未修复、CRT 未初始化、DllMain 未运行。因此本函数必须自包含:
-//   * 不调用任何 IAT 导入函数 (先手工遍历导出表解析 kernel32 再修 IAT)
-//   * 不使用任何需要构造的静态对象
-//   * 参数: rcx=映像基址 (NtQueueApcThread 的 SystemArgument1)
+// UDP 上报: 向本机 35785 端口发送 2 字节 [canAttack][canPlace]
+//   byte0: 0x31 '1'=可以攻击 / 0x30 '0'=不可以   (与旧版 1 字节协议兼容)
+//   byte1: 0x31 '1'=手持放置物 / 0x30 '0'=不是或空手
 //--------------------------------------------------------------------------
-static void* GetPeb(void);   // 前向声明 (定义在反检测段)
-static void* LdrGetProcAddr(HMODULE mod, const char* name)
+static void SendStatus(int canAttack, int canPlace)
 {
-    BYTE* b = (BYTE*)mod;
-    if (!b) return NULL;
-    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)b;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return NULL;
-    IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(b + dos->e_lfanew);
-    DWORD rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
-    if (!rva) return NULL;
-    IMAGE_EXPORT_DIRECTORY* ed = (IMAGE_EXPORT_DIRECTORY*)(b + rva);
-    DWORD* names = (DWORD*)(b + ed->AddressOfNames);
-    WORD*  ords  = (WORD*)(b + ed->AddressOfNameOrdinals);
-    DWORD* funcs = (DWORD*)(b + ed->AddressOfFunctions);
-    for (DWORD i = 0; i < ed->NumberOfNames; i++) {
-        const char* n = (const char*)(b + names[i]);
-        const char* p = name;
-        while (*p && *n && *p == *n) { p++; n++; }
-        if (*p == 0 && *n == 0)
-            return b + funcs[ords[i]];
-    }
-    return NULL;
+    if (g_sock == INVALID_SOCKET) return;
+    char b[2];
+    b[0] = canAttack ? '1' : '0';
+    b[1] = canPlace  ? '1' : '0';
+    sendto(g_sock, b, 2, 0, (const struct sockaddr*)&g_dst, sizeof(g_dst));
 }
-
-// PEB InLoadOrder 遍历找模块基址 (按 BaseDllName 比较; 大小写不敏感)
-static void* PebFindModule(const char* targetLower, int targetLen)
-{
-    unsigned char* peb = (unsigned char*)GetPeb();
-    if (!peb) return NULL;
-    void** ldr = (void**)(peb + 0x18);
-    if (!ldr || !*ldr) return NULL;
-    unsigned char* l = (unsigned char*)*ldr;
-    unsigned char* head = l + 0x10;                    // InLoadOrderModuleList 头
-    for (unsigned char* cur = *(unsigned char**)head; cur && cur != head; cur = *(unsigned char**)cur) {
-        void* dllBase = *(void**)(cur + 0x30);
-        unsigned short len = *(unsigned short*)(cur + 0x58);   // BaseDllName.Length
-        wchar_t* nm = *(wchar_t**)(cur + 0x60);                // BaseDllName.Buffer
-        if (!nm || len < 4) continue;
-        int n = len / 2;
-        if (n != targetLen) continue;
-        bool match = true;
-        for (int i = 0; i < n; i++) {
-            char c = (char)nm[i];
-            if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
-            if (c != targetLower[i]) { match = false; break; }
-        }
-        if (match) return dllBase;
-    }
-    return NULL;
-}
-
-extern "C" void ApcLoader(void* base, void*, void*)
-{
-    if (!base) return;
-    // 1. 手工解析 kernel32 (PEB 遍历 + 导出表遍历, 全程不碰 IAT)
-    static const char k32Name[] = { 'k','e','r','n','e','l','3','2','.','d','l','l' };
-    HMODULE k32 = (HMODULE)PebFindModule(k32Name, sizeof(k32Name));
-    if (!k32) return;
-    void* pGetProc = LdrGetProcAddr(k32, "GetProcAddress");
-    void* pLoadLib = LdrGetProcAddr(k32, "LoadLibraryA");
-    if (!pGetProc || !pLoadLib) return;
-    typedef void* (WINAPI* GPA_t)(HMODULE, const char*);
-    typedef HMODULE (WINAPI* LL_t)(const char*);
-    GPA_t GPA = (GPA_t)pGetProc;
-    LL_t  LL  = (LL_t)pLoadLib;
-
-    // 2. 修复自身 IAT (GetModuleHandle 不可用, 用 LoadLibraryA: 已加载模块只加引用计数)
-    BYTE* b = (BYTE*)base;
-    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)b;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
-    IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(b + dos->e_lfanew);
-    IMAGE_DATA_DIRECTORY& imp = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    DWORD off = 0;
-    while (off + sizeof(IMAGE_IMPORT_DESCRIPTOR) <= imp.Size) {
-        IMAGE_IMPORT_DESCRIPTOR* desc = (IMAGE_IMPORT_DESCRIPTOR*)(b + imp.VirtualAddress + off);
-        if (!desc->Name && !desc->FirstThunk) break;
-        const char* dllName = (const char*)(b + desc->Name);
-        HMODULE mod = LL(dllName);
-        if (!mod) return;
-        ULONGLONG* orig = (ULONGLONG*)(b + (desc->OriginalFirstThunk
-                                            ? desc->OriginalFirstThunk : desc->FirstThunk));
-        ULONGLONG* iat = (ULONGLONG*)(b + desc->FirstThunk);
-        for (int i = 0; orig[i]; i++) {
-            if (iat[i] != 0) continue;   // 幂等: 首次 APC/映射器已修复的槽跳过 (并发安全)
-            ULONGLONG val = 0;
-            if (orig[i] & 0x8000000000000000ULL)
-                val = (ULONGLONG)(ULONG_PTR)GPA(mod, (LPCSTR)(orig[i] & 0xFFFF));
-            else {
-                IMAGE_IMPORT_BY_NAME* ibn = (IMAGE_IMPORT_BY_NAME*)(b + orig[i]);
-                val = (ULONGLONG)(ULONG_PTR)GPA(mod, ibn->Name);
-            }
-            if (!val) return;
-            iat[i] = val;
-        }
-        off += sizeof(IMAGE_IMPORT_DESCRIPTOR);
-    }
-
-    // 3. 执行 DllMain (幂等: g_attached 防重复初始化)
-    typedef BOOL (WINAPI* Entry_t)(HMODULE, DWORD, LPVOID);
-    Entry_t entry = (Entry_t)(b + nt->OptionalHeader.AddressOfEntryPoint);
-    entry((HMODULE)base, DLL_PROCESS_ATTACH, NULL);
-}
-
-//--------------------------------------------------------------------------
-// UDP 上报已移除 (V68): 游戏进程内不再创建 socket / 不做任何网络调用。
-// 状态仅通过共享内存 Local\MCCombatStatus_<pid> 对外发布。
-//--------------------------------------------------------------------------
 
 //--------------------------------------------------------------------------
 // 每帧更新: 计算 "是否能攻击" 并写入共享内存
@@ -1710,7 +1591,7 @@ static void PumpInner(JNIEnv* env, DWORD now)
         if (now - g_lastWork >= kSamplePeriodMs) {
             g_lastWork = now;
             UpdateStatus(env, g_res);
-            // V68: UDP 已移除 (游戏进程内不再创建任何 socket), 仅共享内存通道
+            SendStatus(g_status->canAttack, g_status->canPlace);
         }
         return;
     }
@@ -1729,16 +1610,14 @@ static void PumpFrame(JNIEnv* env)
 //--------------------------------------------------------------------------
 // gdi32!SwapBuffers 钩子: 在游戏渲染线程内复用其 JNIEnv 完成全部检测。
 //--------------------------------------------------------------------------
-static void ReArmGuard(void);   // 前向声明 (定义在 VEH 钩子安装段)
 static BOOL WINAPI HookSwapBuffers(HDC hdc)
 {
     // 惰性获取 JavaVM (JNI_GetCreatedJavaVMs 不附着线程, 不触发 ThreadStart)
     if (!g_vm) {
-        HMODULE jvm = GetModuleHandleA(XS(kEnc_jvm_dll, sizeof(kEnc_jvm_dll)));
+        HMODULE jvm = GetModuleHandleA("jvm.dll");
         if (jvm) {
             GetCreatedVMs_t getVMs =
-                (GetCreatedVMs_t)(void*)GetProcAddress(jvm,
-                    XS(kEnc_JNI_GetCreatedJavaVMs, sizeof(kEnc_JNI_GetCreatedJavaVMs)));
+                (GetCreatedVMs_t)(void*)GetProcAddress(jvm, "JNI_GetCreatedJavaVMs");
             if (getVMs) {
                 JavaVM* v = NULL;
                 jsize   n = 0;
@@ -1761,11 +1640,7 @@ static BOOL WINAPI HookSwapBuffers(HDC hdc)
     } else if (g_status && g_stage == ST_CLS) {
         CopyName(g_status->errMsg, sizeof(g_status->errMsg), "HV:no-vm");
     }
-    BOOL r = g_origSwapBuffers ? g_origSwapBuffers(hdc) : FALSE;
-    // V68 VEH 钩子: guard 已在重定向故障时被硬件清除, 此处执行点在本模块内,
-    // 重新武装保护页供下一帧拦截 (详见 InstallSwapBuffersHook)。
-    ReArmGuard();
-    return r;
+    return g_origSwapBuffers ? g_origSwapBuffers(hdc) : FALSE;
 }
 
 //--------------------------------------------------------------------------
@@ -1921,195 +1796,180 @@ static DWORD ModuleSizeOf(HMODULE m)
     return nt->OptionalHeader.SizeOfImage;
 }
 
-// 安装 gdi32!SwapBuffers 钩子 (V68: VEH 页保护钩子, gdi32/gdi32full 零修改)。
-// 用 PAGE_GUARD 保护真实 SwapBuffers 入口所在页: 渲染线程每次进入函数时
-// 触发 STATUS_GUARD_PAGE_VIOLATION (硬件自动清除保护), VEH 处理器把 RIP
-// 重定向到 HookSwapBuffers; 钩子干完活、执行点回到本模块后重新武装保护页。
-// 同页其他函数被调用时不重定向, 单步离开该页后重新武装 (见 GuardVeh/StepVeh)。
-// 优点: 不写任何代码/数据字节 —— 完整性检查/前后比对看不到任何改动。
-// 也彻底消除旧版"槽位未解析"分支的崩溃面 (解析器原样运行, 尾跳到真实
-// 入口时才触发保护)。
-static BYTE*  g_guardPage  = NULL;
-static BYTE*  g_guardEntry = NULL;
-
-static void ReArmGuard(void)
-{
-    if (!g_guardPage) return;
-    DWORD old = 0;
-    VirtualProtect(g_guardPage, 0x1000, PAGE_EXECUTE_READ | PAGE_GUARD, &old);
-}
-
-static LONG WINAPI GuardVeh(PEXCEPTION_POINTERS ep)
-{
-    if (ep->ExceptionRecord->ExceptionCode != STATUS_GUARD_PAGE_VIOLATION)
-        return EXCEPTION_CONTINUE_SEARCH;
-    void* addr = ep->ExceptionRecord->ExceptionAddress;
-    if (!g_guardPage || (BYTE*)addr < g_guardPage || (BYTE*)addr >= g_guardPage + 0x1000)
-        return EXCEPTION_CONTINUE_SEARCH;
-    if (ep->ContextRecord->Rip == (ULONGLONG)(ULONG_PTR)g_guardEntry) {
-        // 进入 SwapBuffers: 重定向到钩子 (guard 已被硬件清除, 钩子结束再武装)
-        ep->ContextRecord->Rip = (ULONGLONG)(ULONG_PTR)&HookSwapBuffers;
-        return EXCEPTION_CONTINUE_EXECUTION;
-    }
-    // 同页其他函数被调用: 解除保护 + 单步, 离开该页后由 StepVeh 重新武装
-    DWORD old = 0;
-    VirtualProtect(g_guardPage, 0x1000, PAGE_EXECUTE_READ, &old);
-    ep->ContextRecord->EFlags |= 0x100;   // TF
-    return EXCEPTION_CONTINUE_EXECUTION;
-}
-
-static LONG WINAPI StepVeh(PEXCEPTION_POINTERS ep)
-{
-    if (ep->ExceptionRecord->ExceptionCode != STATUS_SINGLE_STEP)
-        return EXCEPTION_CONTINUE_SEARCH;
-    ULONGLONG rip = ep->ContextRecord->Rip;
-    if (g_guardPage && rip >= (ULONGLONG)(ULONG_PTR)g_guardPage &&
-        rip < (ULONGLONG)(ULONG_PTR)(g_guardPage + 0x1000)) {
-        // 仍在保护页内: 继续单步直到离开
-        ep->ContextRecord->EFlags |= 0x100;
-    } else {
-        ReArmGuard();
-    }
-    return EXCEPTION_CONTINUE_EXECUTION;
-}
-
+// 安装 gdi32!SwapBuffers 钩子 (DllMain 内调用; 不涉及 JVM)。
+// 本机形态 (Win10/11): 导出入口是 "FF 25 jmp [slot]" 热补丁存根, slot 是
+// 跨调用共享的数据指针: 初始指向 gdi32 内部解析器存根, 首次调用后解析为
+// gdi32full!SwapBuffers (已验证)。直接原子替换 slot 指针即可拦截全部调用,
+// 绝不执行解析器 (解析器会重读 slot: 槽指向我们时会被当作"已解析"反复
+// 尾跳, 死循环)。
+//   A. 入口 FF 25 槽位模式 -> 解析真实函数后原子替换 slot 指针
+//   B. 老式无槽布局 -> 追链后内联 5/12 字节跳转 + 附近 trampoline
 static bool InstallSwapBuffersHook(void)
 {
-    // VEH 只注册一次 (幂等)
-    static bool vehInstalled = false;
-    if (!vehInstalled) {
-        AddVectoredExceptionHandler(1, GuardVeh);
-        AddVectoredExceptionHandler(1, StepVeh);
-        vehInstalled = true;
-    }
-
-    HMODULE gdi = GetModuleHandleA(XS(kEnc_gdi32_dll, sizeof(kEnc_gdi32_dll)));
+    HMODULE gdi = GetModuleHandleA("gdi32.dll");
     if (!gdi) return false;
-    BYTE* entry = (BYTE*)(void*)GetProcAddress(gdi, XS(kEnc_SwapBuffers, sizeof(kEnc_SwapBuffers)));
+    BYTE* entry = (BYTE*)(void*)GetProcAddress(gdi, "SwapBuffers");
     if (!entry) return false;
 
-    void* val = NULL;
+    // 路径 A: 热补丁槽位模式 (入口 FF 25 jmp [rip+disp32])
     if (entry[0] == 0xFF && entry[1] == 0x25) {
-        // 热补丁存根: 读槽位取目标; 槽未解析(指向 gdi32 内部解析器)时直接取 gdi32full
         INT32 disp;
         memcpy(&disp, entry + 2, 4);
-        val = *(void**)(entry + 6 + disp);
+        BYTE** slot = (BYTE**)(entry + 6 + disp);
+        void* val = *slot;
         BYTE* gdiBase = (BYTE*)gdi;
         DWORD gdiSize = ModuleSizeOf(gdi);
         if ((BYTE*)val >= gdiBase && (BYTE*)val < gdiBase + gdiSize) {
-            HMODULE full = GetModuleHandleA(XS(kEnc_gdi32full_dll, sizeof(kEnc_gdi32full_dll)));
-            if (!full) return false;
-            val = (void*)GetProcAddress(full, XS(kEnc_SwapBuffers, sizeof(kEnc_SwapBuffers)));
+            // 槽未解析 (仍指向 gdi32 内部解析器存根): 直接取 gdi32full 实现
+            HMODULE full = GetModuleHandleA("gdi32full.dll");
+            if (!full) {
+                if (g_status) CopyName(g_status->failLog, sizeof(g_status->failLog),
+                                       "hook:gdi32full-not-loaded");
+                return false;
+            }
+            val = (void*)GetProcAddress(full, "SwapBuffers");
             if (!val) return false;
         }
-    } else {
-        val = entry;
+        void* real = (void*)ResolveRealEntry((BYTE*)val);
+        if (!real) return false;
+        DWORD old = 0;
+        if (!VirtualProtect(slot, 8, PAGE_READWRITE, &old)) return false;
+        *slot = (BYTE*)(void*)&HookSwapBuffers;   // 对齐 8 字节写: x64 原子
+        VirtualProtect(slot, 8, old, &old);
+        g_origSwapBuffers = (SwapBuffersFn)real;  // 直连真实函数, 不经槽位
+        return true;
     }
-    BYTE* real = ResolveRealEntry((BYTE*)val);
-    if (!real) return false;
 
-    g_origSwapBuffers = (SwapBuffersFn)real;
-    g_guardEntry = real;
-    g_guardPage  = (BYTE*)((ULONGLONG)real & ~0xFFFULL);
+    // 路径 B: 内联钩子 (追 FF 25/E9 存根链到真实函数体)
+    BYTE* target = ResolveRealEntry(entry);
+    if (!target) return false;
+    int need = FitsRel32(target, (void*)&HookSwapBuffers) ? 5 : 12;
+    int total = 0;
+    while (total < need) {
+        int l = InsnLen64(target + total);
+        if (l <= 0 || InsnNeedsReloc(target + total, l)) {
+            if (g_status) {
+                char hex[96];
+                hex[0] = 0;
+                for (int k = 0; k < 8; ++k) {
+                    char b[8];
+                    snprintf(b, sizeof(b), "%s%02X", k ? " " : "", target[k]);
+                    strncat(hex, b, sizeof(hex) - strlen(hex) - 1);
+                }
+                snprintf(g_status->failLog, sizeof(g_status->failLog),
+                         "hook:decode-fail@%d [%s]", total, hex);
+            }
+            return false;
+        }
+        total += l;
+    }
+    memcpy(g_patch, target, total);   // 保存原始字节 (诊断用; 有意不在退出时还原)
+    g_patchLen = total;
+
+    // 在目标附近分配 trampoline (保证 tramp+total -> target+total 的 rel32 可达)
+    INT64 base = (INT64)target;
+    BYTE* tramp = NULL;
+    for (int t = 0; t < 64 && !tramp; ++t) {
+        INT64 addr = base - 0x40000000LL + (INT64)t * 0x08000000LL;
+        BYTE* m = (BYTE*)VirtualAlloc((void*)addr, 64, MEM_COMMIT | MEM_RESERVE,
+                                      PAGE_EXECUTE_READWRITE);
+        if (m && FitsRel32(m + total, target + total)) tramp = m;
+        else if (m) VirtualFree(m, 0, MEM_RELEASE);
+    }
+    if (!tramp) return false;
+    memcpy(tramp, target, total);
+    if (!WriteRelJmp(tramp + total, target + total)) {
+        VirtualFree(tramp, 0, MEM_RELEASE);
+        return false;
+    }
+
+    // 先设好跳转再打补丁: 任何时刻被调用都有有效目标
+    g_origSwapBuffers = (SwapBuffersFn)tramp;
+
+    // 打补丁前挂起其他线程 (游戏渲染线程可能正在执行目标函数,
+    // 撕裂写入会造成崩溃; 挂起窗口极小, 游戏无感)
+    HANDLE hThreads[1024];
+    int nThreads = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap != INVALID_HANDLE_VALUE) {
+        THREADENTRY32 te;
+        te.dwSize = sizeof(te);
+        DWORD self = GetCurrentThreadId(), selfPid = GetCurrentProcessId();
+        if (Thread32First(snap, &te)) {
+            do {
+                if (te.th32OwnerProcessID == selfPid && te.th32ThreadID != self &&
+                    nThreads < (int)(sizeof(hThreads)/sizeof(hThreads[0]))) {
+                    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+                    if (h) {
+                        SuspendThread(h);
+                        hThreads[nThreads++] = h;   // 保留句柄, 稍后恢复
+                    }
+                }
+            } while (Thread32Next(snap, &te));
+        }
+    }
 
     DWORD old = 0;
-    if (!VirtualProtect(g_guardPage, 0x1000, PAGE_EXECUTE_READ | PAGE_GUARD, &old))
+    bool ok = VirtualProtect(target, total, PAGE_EXECUTE_READWRITE, &old) != 0;
+    if (ok) {
+        if (!WriteRelJmp(target, (void*)&HookSwapBuffers))
+            WriteAbsJmp(target, (void*)&HookSwapBuffers);
+        VirtualProtect(target, total, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), target, total);
+        FlushInstructionCache(GetCurrentProcess(), tramp, total + 5);
+    }
+
+    for (int i = 0; i < nThreads; ++i) {
+        ResumeThread(hThreads[i]);
+        CloseHandle(hThreads[i]);
+    }
+    if (snap != INVALID_HANDLE_VALUE) CloseHandle(snap);
+
+    if (!ok) {
+        VirtualFree(tramp, 0, MEM_RELEASE);
+        g_origSwapBuffers = NULL;
         return false;
+    }
     return true;
 }
 
 //--------------------------------------------------------------------------
-// 反检测: 从 PEB 模块三链表摘除自身 (枚举不到) + 抹除 PE 头。
-// 手动映射时无 LDR 条目, 摘链自然为空操作; LoadLibrary 路径同样适用。
+// 导出函数 (协议不变, 供其他程序调用)
 //--------------------------------------------------------------------------
-// V66.1: PEB 摘链 + PE 头抹除在网易版真机上被反作弊判为"隐藏/篡改模块"
-// (进黑屋局)。V65.1 的可见模块形态 (不摘链/不抹头) 真机 60s+ 无异常,
-// 因此默认关闭这两项 —— 运行时行为与真机验证版完全一致。
-// 手动映射路径本来就没有 PEB 条目, 关闭后行为不变。
-#define HIDE_MODULE_ANTI_DETECT 0
-//--------------------------------------------------------------------------
-static void* GetPeb(void)
+extern "C" {
+
+__declspec(dllexport) BOOL WINAPI GetCanAttackNow(void)
 {
-    void* p = NULL;
-    __asm__ __volatile__("movq %%gs:0x60, %0" : "=r"(p));
-    return p;
+    return (g_status && g_status->ready) ? (BOOL)g_status->canAttack : FALSE;
 }
 
-static void UnlinkFromPeb(void)
+__declspec(dllexport) BOOL WINAPI IsJniReady(void)
 {
-    unsigned char* peb = (unsigned char*)GetPeb();
-    if (!peb) return;
-    void** ldr = (void**)(peb + 0x18);                 // PEB->Ldr
-    if (!ldr || !*ldr) return;
-    unsigned char* l = (unsigned char*)*ldr;
-    // 本模块基址: 从函数地址的分配基取
-    MEMORY_BASIC_INFORMATION mbi = {};
-    if (!VirtualQuery((void*)&UnlinkFromPeb, &mbi, sizeof(mbi))) return;
-    unsigned char* self = (unsigned char*)mbi.AllocationBase;
-
-    // LDR_DATA_TABLE_ENTRY: 三链表分别在 0x00/0x10/0x20, DllBase 在 0x30
-    for (int off = 0; off <= 0x20; off += 0x10) {
-        unsigned char* head = l + 0x10 + off;          // In*OrderModuleList 头
-        unsigned char* cur = *(unsigned char**)head;
-        while (cur && cur != head) {
-            unsigned char* entry = cur - off;          // 条目基址
-            unsigned char* base = *(unsigned char**)(entry + 0x30);
-            if (base == self) {
-                unsigned char* fl = *(unsigned char**)cur;
-                unsigned char* bl = *(unsigned char**)(cur + 8);
-                *(unsigned char**)bl = fl;
-                *(unsigned char**)(fl + 8) = bl;
-                // 抹掉名字 (FullDllName@0x48 / BaseDllName@0x58)
-                *(unsigned short*)(entry + 0x48) = 0;         // Length
-                *(unsigned long long*)(entry + 0x50) = 0;     // Buffer
-                *(unsigned short*)(entry + 0x58) = 0;
-                *(unsigned long long*)(entry + 0x60) = 0;
-                break;
-            }
-            cur = *(unsigned char**)cur;
-        }
-    }
+    return g_status ? (BOOL)g_status->ready : FALSE;
 }
 
-static void ErasePeHeader(void)
+__declspec(dllexport) BOOL WINAPI GetCombatStatus(CombatStatus* out)
 {
-    MEMORY_BASIC_INFORMATION mbi = {};
-    if (!VirtualQuery((void*)&ErasePeHeader, &mbi, sizeof(mbi))) return;
-    void* base = mbi.AllocationBase;
-    if (!base) return;
-    DWORD old = 0;
-    if (VirtualProtect(base, 0x1000, PAGE_READWRITE, &old)) {
-        memset(base, 0, 0x1000);
-        VirtualProtect(base, 0x1000, old, &old);
-    }
+    if (!out || !g_status) return FALSE;
+    *out = *g_status;
+    return TRUE;
 }
 
-//--------------------------------------------------------------------------
-// -nostartfiles 链接时的占位: 伪重定位 (_pei386_runtime_relocator) 只在
-// MinGW CRT 启动时执行; 本 DLL 入口直指 DllMain 不经过 CRT。伪重定位
-// 列表由注入器的手动映射器在映射阶段直接应用 (列表位于 .rdata 开头)。
-//--------------------------------------------------------------------------
-extern "C" void _pei386_runtime_relocator(void) {}
+} // extern "C"
 
 //--------------------------------------------------------------------------
 // DLL 入口 (V65): 不创建任何线程, 只装钩子。
 // 全部检测工作在游戏渲染线程 (Client thread) 内由 SwapBuffers 钩子驱动。
-// 注意: 链接时 -nostartfiles -Wl,-e,DllMain 直接把入口指向本函数 (跳过
-// MinGW CRT 启动), 使手动映射无需伪重定位运行时; 因此本函数必须是
-// extern "C" 且不自依赖任何 CRT 初始化状态。
 //--------------------------------------------------------------------------
-extern "C" BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
+BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH) {
-        // V68: 不再调用 DisableThreadLibraryCalls —— 线程劫持执行时目标线程
-        // 可能持有 loader lock, 调用它会死锁; 且本 DLL 已无 LoadLibrary 路径,
-        // 不存在线程附加通知, 该调用无意义。
-        if (InterlockedExchange(&g_attached, 1)) return TRUE; // 防重复加载二次初始化
+        DisableThreadLibraryCalls(hInst);
+        if (InterlockedExchange(&g_attached, 1)) return TRUE; // 防重复 LoadLibrary 二次初始化
 
         // 防重复注入: 若共享内存已存在且健康 (ready 或 tick>0), 说明已有实例在运行
         char mapName[64];
-        snprintf(mapName, sizeof(mapName), XS(kEnc_MCCombatStatus_fmt, sizeof(kEnc_MCCombatStatus_fmt)),
-                 (unsigned long)GetCurrentProcessId());
+        snprintf(mapName, sizeof(mapName), kMapNameFmt, (unsigned long)GetCurrentProcessId());
         HANDLE existing = OpenFileMappingA(FILE_MAP_READ, FALSE, mapName);
         if (existing) {
             CombatStatus* st = (CombatStatus*)MapViewOfFile(existing, FILE_MAP_READ, 0, 0, 0);
@@ -2133,7 +1993,17 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
         g_status->pid     = GetCurrentProcessId();
         CopyName(g_status->errMsg, sizeof(g_status->errMsg), "H0:dllmain-init");
 
-        // V68: UDP 已移除, 无 socket 初始化
+        // UDP: 初始化 socket, 目标为本机 35785 端口 (协议不变)
+        WSADATA wsa;
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) == 0) {
+            g_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+            if (g_sock != INVALID_SOCKET) {
+                memset(&g_dst, 0, sizeof(g_dst));
+                g_dst.sin_family      = AF_INET;
+                g_dst.sin_port        = htons(35785);
+                g_dst.sin_addr.s_addr = inet_addr("127.0.0.1");
+            }
+        }
 
         // 钩住 gdi32!SwapBuffers (游戏渲染线程每帧调用)
         if (!InstallSwapBuffersHook()) {
@@ -2142,14 +2012,10 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
         } else if (g_status) {
             CopyName(g_status->errMsg, sizeof(g_status->errMsg), "H0:hook-ok");
         }
-
-        // 反检测 (默认关闭, 见 HIDE_MODULE_ANTI_DETECT 上方说明: 网易真机会黑屋)
-#if HIDE_MODULE_ANTI_DETECT
-        UnlinkFromPeb();
-        ErasePeHeader();
-#endif
     }
     else if (reason == DLL_PROCESS_DETACH) {
+        if (g_sock != INVALID_SOCKET) { closesocket(g_sock); g_sock = INVALID_SOCKET; }
+        WSACleanup();
         if (g_status) { UnmapViewOfFile(g_status); g_status = NULL; }
         if (g_map)    { CloseHandle(g_map);    g_map    = NULL; }
         // 钩子有意不还原: DLL 与进程同生命周期, 进程退出阶段还原补丁
